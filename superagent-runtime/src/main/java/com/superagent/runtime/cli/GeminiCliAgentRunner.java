@@ -18,8 +18,9 @@ import java.util.Map;
 
 /**
  * Google Gemini CLI: {@code gemini -p … -o stream-json}. No {@code --mcp-config}; MCP is written into an
- * isolated {@code GEMINI_CONFIG_DIR}/settings.json ({@code httpUrl} + headers) so the machine's
- * {@code ~/.gemini} is never touched.
+ * isolated {@code <GEMINI_CLI_HOME>/.gemini/settings.json} ({@code httpUrl} + headers) so the machine's
+ * real {@code ~/.gemini} is never touched. {@code GEMINI_CLI_HOME} is the home root that contains
+ * {@code .gemini/} (official Storage / docs semantics).
  */
 @Component
 public class GeminiCliAgentRunner extends JsonLineCliRunner {
@@ -38,9 +39,8 @@ public class GeminiCliAgentRunner extends JsonLineCliRunner {
 
     @Override
     protected List<String> buildCommand(AgentRunRequest request, String resumeId, List<Path> cleanup) throws IOException {
-        Path configDir = configDir(request);
-        Files.createDirectories(configDir);
-        writeSettings(configDir, request);
+        Path home = configDir(request);
+        writeSettings(home, request);
         List<String> cmd = new ArrayList<>(List.of(command(), "-p", prompt(request, resumeId),
                 "--output-format", "stream-json", "--skip-trust",
                 "--approval-mode", approvalMode(request)));
@@ -83,8 +83,11 @@ public class GeminiCliAgentRunner extends JsonLineCliRunner {
         return root.toString();
     }
 
-    private void writeSettings(Path configDir, AgentRunRequest request) throws IOException {
-        Files.writeString(configDir.resolve("settings.json"),
+    /** Writes {@code <home>/.gemini/settings.json}; rewrites every turn so MCP bearer tokens stay current. */
+    private void writeSettings(Path home, AgentRunRequest request) throws IOException {
+        Path geminiDir = home.resolve(".gemini");
+        Files.createDirectories(geminiDir);
+        Files.writeString(geminiDir.resolve("settings.json"),
                 settingsJson(CodexCliAgentRunner.mcpServers(request)));
     }
 
@@ -93,8 +96,11 @@ public class GeminiCliAgentRunner extends JsonLineCliRunner {
         return Path.of(request.workspaceDir(), ".superagent", "gemini-home", request.sessionId());
     }
 
-    /** Env for a Gemini process: key, optional base URL, and isolated config/home. */
-    static Map<String, String> environment(RunCredential credential, Path configDir) {
+    /**
+     * Env for a Gemini process: key, optional base URL, and isolated home via {@code GEMINI_CLI_HOME}
+     * (settings live at {@code $GEMINI_CLI_HOME/.gemini/settings.json}).
+     */
+    static Map<String, String> environment(RunCredential credential, Path home) {
         Map<String, String> env = new HashMap<>();
         if (credential != null) {
             env.put("GEMINI_API_KEY", credential.apiKey());
@@ -102,9 +108,9 @@ public class GeminiCliAgentRunner extends JsonLineCliRunner {
                 env.put("GOOGLE_GEMINI_BASE_URL", credential.baseUrl().strip());
             }
         }
-        env.put("GEMINI_CONFIG_DIR", configDir.toString());
+        env.put("GEMINI_CLI_HOME", home.toString());
         // Keep projects.json / session files out of the operator's real home.
-        env.put("HOME", configDir.toString());
+        env.put("HOME", home.toString());
         return env;
     }
 

@@ -32,6 +32,7 @@ async function initAuth() {
   if (me.mustChangePassword) { openAccount(true); return false; } // nothing else works until they do: don't boot the app
   loadAvatarVersions(); // other people's pictures, for member lists
   loadPeopleNames();
+  refreshReplying(); // restore the sidebar spinners at once after a reload, not on the first poll tick
   // Admin-only sections: hide for non-admins.
   const showAdmin = !!me.admin;
   isAdmin = showAdmin;
@@ -255,6 +256,12 @@ let userKind = "local";      // what's being added: local (username + password) 
 
 Object.assign(api, {
   orgOverview: () => fetch("/api/v1/admin/org").then(r => r.json()),
+  handoverPreview: body => fetch("/api/v1/admin/handover/preview", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+  }).then(r => r.json()),
+  handoverExecute: body => fetch("/api/v1/admin/handover", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+  }).then(r => r.json()),
 });
 
 async function loadUsers() {
@@ -315,6 +322,7 @@ function userRow(u) {
   if (!builtIn) {
     cell.append(
       linkBtn(L("common.edit"), () => openUserModal(u), "link-btn--muted"),
+      linkBtn(L("users.handover"), () => openHandoverModal(u), "link-btn--muted"),
       linkBtn(u.enabled ? L("users.disable") : L("users.enable"), () => toggleUser(u), "link-btn--muted"),
       linkBtn(L("common.delete"), () => deleteUser(u), "link-btn--danger"));
   }
@@ -445,6 +453,114 @@ uel.form.addEventListener("submit", async e => {
     closeUserModal();
     await loadUsers();
   } catch (err) { showToast(L("users.saveFailed"), true); } finally { uel.submit.disabled = false; }
+});
+
+// ---- employee handover ----
+const ho = {
+  modal: document.getElementById("handoverModal"),
+  form: document.getElementById("handoverForm"),
+  fromLabel: document.getElementById("hoFromLabel"),
+  to: document.getElementById("hoTo"),
+  disable: document.getElementById("hoDisable"),
+  preview: document.getElementById("hoPreview"),
+  warnings: document.getElementById("hoWarnings"),
+  error: document.getElementById("hoError"),
+  previewBtn: document.getElementById("hoPreviewBtn"),
+  submit: document.getElementById("hoSubmit"),
+};
+let handoverFrom = null;
+
+function openHandoverModal(u) {
+  handoverFrom = u;
+  ho.fromLabel.textContent = userLabel(u) + " (" + u.username + ")";
+  ho.to.replaceChildren();
+  const ph = document.createElement("option");
+  ph.value = "";
+  ph.textContent = L("users.handoverToPh");
+  ho.to.appendChild(ph);
+  allUsers.filter(x => x.id !== u.id && x.enabled !== false).forEach(x => {
+    const o = document.createElement("option");
+    o.value = x.username;
+    o.textContent = userLabel(x) + " (" + x.username + ")";
+    ho.to.appendChild(o);
+  });
+  ho.disable.checked = true;
+  ho.preview.hidden = true;
+  ho.warnings.hidden = true;
+  ho.warnings.replaceChildren();
+  ho.error.hidden = true;
+  ho.modal.hidden = false;
+}
+
+function closeHandoverModal() {
+  ho.modal.hidden = true;
+  handoverFrom = null;
+}
+
+ho.modal?.querySelectorAll("[data-close]").forEach(el => el.addEventListener("click", closeHandoverModal));
+
+async function runHandoverPreview() {
+  if (!handoverFrom || !ho.to.value) {
+    showToast(L("users.handoverPickTo"), true);
+    return null;
+  }
+  ho.error.hidden = true;
+  const res = await api.handoverPreview({ fromUsername: handoverFrom.username, toUsername: ho.to.value });
+  if (!res || !res.data) {
+    ho.error.textContent = (res && res.message) || L("users.handoverFailed");
+    ho.error.hidden = false;
+    return null;
+  }
+  const d = res.data;
+  const tasks = (d.tasks && (d.tasks.running + d.tasks.pending + d.tasks.waiting + d.tasks.needsConfirmation + d.tasks.terminal)) || 0;
+  ho.preview.textContent = L("users.handoverSummary", {
+    agents: d.agents || 0,
+    tasks,
+    files: d.files || 0,
+    folders: d.folders || 0,
+    projects: d.projects || 0,
+    skills: d.personalSkills || 0,
+    automations: d.automations || 0,
+  });
+  ho.preview.hidden = false;
+  ho.warnings.replaceChildren();
+  (d.warnings || []).forEach(w => {
+    const li = document.createElement("li");
+    li.textContent = w;
+    ho.warnings.appendChild(li);
+  });
+  ho.warnings.hidden = !(d.warnings && d.warnings.length);
+  return d;
+}
+
+ho.previewBtn?.addEventListener("click", () => { runHandoverPreview().catch(() => showToast(L("users.handoverFailed"), true)); });
+
+ho.form?.addEventListener("submit", async e => {
+  e.preventDefault();
+  if (!handoverFrom || !ho.to.value) {
+    showToast(L("users.handoverPickTo"), true);
+    return;
+  }
+  ho.submit.disabled = true;
+  try {
+    await runHandoverPreview();
+    const res = await api.handoverExecute({
+      fromUsername: handoverFrom.username,
+      toUsername: ho.to.value,
+      disableFromUser: !!ho.disable.checked,
+    });
+    if (!res || !res.data) {
+      showToast((res && res.message) || L("users.handoverFailed"), true);
+      return;
+    }
+    showToast(L("users.handoverDone"));
+    closeHandoverModal();
+    await loadUsers();
+  } catch (err) {
+    showToast(L("users.handoverFailed"), true);
+  } finally {
+    ho.submit.disabled = false;
+  }
 });
 
 // language switcher

@@ -59,7 +59,7 @@ function todoTabItems(filter) {
 }
 
 function renderTodos() {
-  tdel.tabs.querySelectorAll(".model-tab").forEach(t => {
+  tdel.tabs.querySelectorAll(".ws-tab").forEach(t => {
     const f = t.dataset.filter;
     t.classList.toggle("is-active", f === todoFilter);
     if (f === "messages") return; // counted from the message stream (setTodoMessagesCount)
@@ -202,7 +202,8 @@ function todoActions(n) {
         // Saying yes needs no page: the task carries on. Looking first is a click away.
         : [[L("todo.confirmGo"), async () => {
             await confirmTaskFromTodo(n.linkId);
-            await api.noticeAction(n.id, "done");
+            // The task resuming usually closes the item already (it then 404s): only a slower start needs this.
+            await api.noticeAction(n.id, "done").catch(() => {});
           }, true], [L("todo.handle"), () => openTaskFromTodo(n.linkId)], ignore];
     case "action":
       // To-dos come from received messages: the stream is where to read them in full.
@@ -212,6 +213,11 @@ function todoActions(n) {
     case "done":
       return [[L("todo.viewResult"), async () => { await api.noticeAction(n.id, "done"); openTaskFromTodo(n.linkId); }, true], read];
     default:
+      if (n.linkType === "proxyconfirm") {
+        return [[L("pc.revoke"), async () => {
+          try { await api.proxyRevoke(n.linkId); } catch (e) { showToast(e.message, true); return; }
+        }, true], read];
+      }
       return n.linkType === "agent"
         ? [[L("todo.open"), async () => { await api.noticeAction(n.id, "done"); await openAgentFromTodo(n.linkId); }, true], read]
         : [read];
@@ -247,7 +253,7 @@ async function openAgentFromTodo(agentId) {
 }
 
 tdel.tabs.addEventListener("click", e => {
-  const t = e.target.closest(".model-tab");
+  const t = e.target.closest(".ws-tab");
   if (!t) return;
   todoFilter = t.dataset.filter;
   renderTodos();

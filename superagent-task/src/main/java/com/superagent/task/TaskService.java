@@ -75,6 +75,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -103,6 +104,12 @@ public class TaskService implements TaskRecovery {
     private final ChatStore runStore;
     private final Map<AgentType, AgentRunner> runners = new EnumMap<>(AgentType.class);
     private final Map<String, Cancellation> activeRuns = new ConcurrentHashMap<>();
+    /** The company each active run belongs to, so shutdown (on Spring's thread) can mark it in the right tenant. */
+    private final Map<String, String> activeCompanies = new ConcurrentHashMap<>();
+    /** Set once the server starts shutting down: nothing new starts, and a cut-short run keeps its RUNNING status. */
+    private volatile boolean shuttingDown;
+    /** Runs a shutdown cut short: their settle is skipped, so the task stays RUNNING for the restart to pick up. */
+    private final Set<String> interruptedByShutdown = ConcurrentHashMap.newKeySet();
     /**
      * Images attached to a steering message, handed to the next turn this task runs (the one that
      * carries that message) and then dropped, so later phase turns don't re-send them. A side
@@ -134,6 +141,39 @@ public class TaskService implements TaskRecovery {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     void setCredentials(CredentialService credentials) {
         this.credentials = credentials;
+    }
+
+    private com.superagent.core.proxyconfirm.ProxyConfirmGate proxyConfirmGate; // null in tests: nothing is confirmed for anyone
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setProxyConfirmGate(com.superagent.core.proxyconfirm.ProxyConfirmGate gate) {
+        this.proxyConfirmGate = gate;
+    }
+
+    /** The project an agent sits in, if any (rules for "confirm for me" can be set per project). */
+    String projectOfAgent(String agentId) {
+        return projects == null ? null : projects.projectOfAgent(agentId).orElse(null);
+    }
+
+    /** What an agent asks before it makes a task without the user's reply (see {@link TaskMcpTools}): the record id, or null. */
+    public String proxyConfirmed(String owner, String projectId, com.superagent.core.proxyconfirm.ConfirmType type,
+                                 String object, java.util.Map<String, Object> facts) {
+        if (proxyConfirmGate == null) {
+            return null;
+        }
+        var d = proxyConfirmGate.decide(owner, projectId, type, "task", object, facts);
+        return d.confirmed() ? d.recordId() : null;
+    }
+
+    /** Whether {@code recordId} is a live confirmation of exactly this type for a task titled {@code title}. */
+    boolean proxyClaimable(String owner, String recordId, com.superagent.core.proxyconfirm.ConfirmType type, String title) {
+        return proxyConfirmGate != null && proxyConfirmGate.claimable(owner, recordId, title).filter(type::equals).isPresent();
+    }
+
+    void proxyConfirmCreated(String owner, String recordId, String taskId) {
+        if (proxyConfirmGate != null && recordId != null) {
+            proxyConfirmGate.attach(owner, recordId, taskId);
+        }
     }
 
     private com.superagent.platform.connector.ConnectorService connectors; // null in tests: no company connectors
@@ -216,6 +256,13 @@ public class TaskService implements TaskRecovery {
         this.links = links;
     }
 
+    private TaskDependencies dependencies; // null in tests: tasks never wait for one another
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setDependencies(com.superagent.core.task.TaskDependencyStore store) {
+        this.dependencies = new TaskDependencies(store, events);
+    }
+
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     void setTagStore(com.superagent.core.task.TaskTagStore tagStore) {
         this.tagStore = tagStore;
@@ -226,8 +273,21 @@ public class TaskService implements TaskRecovery {
         this.settings = settings;
     }
 
+    private com.superagent.core.writing.StyleGuideSource styleGuide; // null = no document standard (tests)
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setStyleGuide(com.superagent.core.writing.StyleGuideSource styleGuide) {
+        this.styleGuide = styleGuide;
+    }
+
     private final ApplicationEventPublisher events;   // null = no to-do items (tests)
-    private final CodingFlow codingFlow;
+    /** Built-in flows by task kind (coding today): they run the task step by step and judge each step themselves. */
+    private final Map<String, com.superagent.task.harness.TaskHarness> harnesses = new HashMap<>();
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setHarnesses(List<com.superagent.task.harness.TaskHarness> list) {
+        list.forEach(h -> harnesses.put(h.kind(), h));
+    }
 
     // Session reuse + per-owner parallelism. All pool/queue access is under schedulerLock.
     private final TaskSessionPool pool;
@@ -261,7 +321,6 @@ public class TaskService implements TaskRecovery {
             FileService files) {
         this.tasks = tasks;
         this.phaseStore = phaseStore;
-        this.codingFlow = new CodingFlow(phaseStore);
         this.runStates = runStates;
         this.runStore = runStore;
         this.images = images;
@@ -580,10 +639,54 @@ public class TaskService implements TaskRecovery {
         Task task = requireVisible(id, owner);
         List<MessageDto> messages = runStore.listMessages(id).stream().map(m -> toMessageDto(id, m)).toList();
         List<TaskEventDto> events = runStore.listEvents(id).stream().map(TaskService::toEventDto).toList();
-        List<TaskPhaseDto> phases = TaskKind.fromStorage(task.flow()) == TaskKind.CODING
-                ? codingFlow.load(id).stream().map(TaskService::toPhaseDto).toList()
-                : List.of();
-        return new TaskDetailDto(toDto(task), task.brief(), messages, events, phases);
+        com.superagent.task.harness.HarnessState state = harnessState(id).orElse(null);
+        List<TaskPhaseDto> phases = state == null ? List.of() : state.steps.stream()
+                .map(st -> new TaskPhaseDto(st.key, st.name, st.status.name().toLowerCase(), null, st.note)).toList();
+        return new TaskDetailDto(toDto(task), task.brief(), messages, events, phases,
+                state == null ? null : com.superagent.task.harness.HarnessViews.dto(state));
+    }
+
+    /** A subtitle task's result: the subtitles, every disputed span, the glossary. */
+    public com.superagent.api.task.SubtitleDto subtitle(String id, String user) {
+        Task task = requireVisible(id, user);
+        var harness = subtitleHarness();
+        com.superagent.task.harness.HarnessState state = harnessState(id)
+                .filter(st -> com.superagent.task.harness.subtitle.SubtitleHarness.KIND.equals(st.harness))
+                .orElseThrow(() -> new TaskNotFoundException(id));
+        var view = harness.view(state, task, harnessHost);
+        return view == null ? null : com.superagent.task.harness.subtitle.SubtitleViews.dto(view,
+                harnessHost.projectOf(task).orElse(null));
+    }
+
+    /** The owner fixes one disputed span of a subtitle task: the files are rewritten, the glossary learns it. */
+    public com.superagent.api.task.SubtitleDto fixSubtitle(String id, String owner, String spanId, String text) {
+        Task task = require(id, owner);
+        com.superagent.task.harness.HarnessState state = harnessState(id)
+                .filter(st -> com.superagent.task.harness.subtitle.SubtitleHarness.KIND.equals(st.harness))
+                .orElseThrow(() -> new TaskNotFoundException(id));
+        subtitleHarness().fix(task, state, harnessHost, spanId, text, owner)
+                .ifPresent(term -> harnessHost.note(task, "疑点修改已记进术语表：" + term));
+        return subtitle(id, owner);
+    }
+
+    /** The models a subtitle task would use now, for the agent's confirm table. */
+    public String subtitleModels() {
+        var h = harnesses.get(com.superagent.task.harness.subtitle.SubtitleHarness.KIND);
+        return h == null ? "这里没有接入字幕流程。" : ((com.superagent.task.harness.subtitle.SubtitleHarness) h).models();
+    }
+
+    private com.superagent.task.harness.subtitle.SubtitleHarness subtitleHarness() {
+        var h = harnesses.get(com.superagent.task.harness.subtitle.SubtitleHarness.KIND);
+        if (h == null) {
+            throw new IllegalStateException("subtitle flow not wired");
+        }
+        return (com.superagent.task.harness.subtitle.SubtitleHarness) h;
+    }
+
+    /** One changed file's diff in a harness-run task (empty when it has none). */
+    public String harnessDiff(String id, String owner, String path) {
+        requireVisible(id, owner);
+        return harnessState(id).map(s -> s.patches.getOrDefault(path, "")).orElse("");
     }
 
     /** Events from {@code offset} onward (chronological), for incremental polling of a running task. */
@@ -698,7 +801,7 @@ public class TaskService implements TaskRecovery {
         }
         return new CreateTaskRequest(request.title(), (request.brief() == null ? "" : request.brief()) + note, request.source(),
                 request.repo(), request.branch(), request.flow(), request.model(), request.agentType(), request.kind(),
-                request.tier(), request.continuesFrom());
+                request.tier(), request.continuesFrom(), request.delivery(), request.after(), request.genre());
     }
 
     private static String materialName(LinkContent c) {
@@ -767,7 +870,18 @@ public class TaskService implements TaskRecovery {
         }
         TaskSource source = parseSource(request.source());
         TaskKind kind = parentId != null ? TaskKind.GENERAL : resolveKind(request); // one level: a subtask doesn't split
+        com.superagent.task.harness.TaskHarness harness = harnesses.get(kind.storageName());
+        if (harness != null) {
+            harness.precheck(blankToNull(request.repo()), blankToNull(request.branch()), request.delivery(), who, harnessHost);
+        }
         Instant now = Instant.now();
+        List<String> after = parentId != null ? List.of() : TaskDependencies.named(request.after(), continuesFrom);
+        if (dependencies != null) {
+            after.forEach(d -> requireVisible(d, who)); // only tasks its creator can see; a missing one is "not found"
+            dependencies.record(id, after, now); // before the task row: the scheduler must never see it without them
+        } else if (request.after() != null && !request.after().isEmpty()) {
+            throw new IllegalStateException("waiting for other tasks needs a task dependency store");
+        }
         // No workspace yet: it comes from the session this task is scheduled onto.
         // The kind is stored in the (otherwise unused) flow column — zero migration.
         Task task = new Task(id, cleanTitle(request.title()), blankToNull(request.brief()),
@@ -775,13 +889,25 @@ public class TaskService implements TaskRecovery {
                 blankToNull(request.repo()), blankToNull(request.branch()), kind.storageName(),
                 TaskStatus.PENDING, 0, BigDecimal.ZERO, model, agentType,
                 null, who, null, now, null, null, now, null);
-        tasks.save(task);
+        if (harness != null) {
+            // Before the task row: the scheduler may pick it up at once, and then must find it a harness task.
+            phaseStore.save(id, harness.start(task, request.delivery(), blankToNull(request.genre())).toJson());
+        } else if (kind == TaskKind.COMPLEX && general() != null) {
+            // Its conclusion is checked: only a complex task created with this record is (not one from before).
+            phaseStore.save(id, general().startSummary().toJson());
+        }
+        try {
+            tasks.save(task);
+        } catch (RuntimeException e) {
+            if (dependencies != null && !after.isEmpty()) {
+                dependencies.clear(id); // no task, nothing to wait
+            }
+            throw e;
+        }
+        tasks.assignNumber(id);
         if (links != null && (parentId != null || continuesFrom != null)) {
             // Before the scheduler can see it: admission holds subtasks back to the parallel limit.
             links.save(new com.superagent.core.task.TaskLink(id, parentId, continuesFrom, now));
-        }
-        if (kind == TaskKind.CODING) {
-            codingFlow.persist(id, CodingFlow.initialPhases());
         }
         if (agentId != null && skills != null) {
             skills.bindTaskToAgent(id, agentId); // before scheduling, so the first turn already has them
@@ -806,6 +932,27 @@ public class TaskService implements TaskRecovery {
         Runnable wake = wakeScheduler;
         if (wake != null) {
             wake.run(); // recorded now, run by the scheduler
+        } else if (after.isEmpty() || dependencies == null) {
+            admit(task);
+        }
+        return toDto(task);
+    }
+
+    /**
+     * "Don't wait, run it": a task stuck because one it waits for failed or was stopped drops what it waits for, so
+     * the scheduler starts it on its next pass. One that is only waiting starts by itself and is refused.
+     */
+    public TaskDto runNow(String id, String owner) {
+        Task task = require(id, owner);
+        if (dependencies == null || task.status() != TaskStatus.PENDING || task.workspaceDir() != null
+                || TaskDependencies.wait(dependencies.of(id), d -> tasks.findTask(d).orElse(null), this::finished).blocker() == null) {
+            throw new TaskNotBlockedException(id);
+        }
+        dependencies.clear(id);
+        log.info("task {}: no longer waits for other tasks (run now)", id);
+        Runnable wake = wakeScheduler;
+        if (wake != null) {
+            wake.run();
         } else {
             admit(task);
         }
@@ -832,6 +979,9 @@ public class TaskService implements TaskRecovery {
         this.wakeScheduler = wake;
     }
 
+    /** A dependency row this old whose task never got saved is left over from a creation that failed. */
+    private static final java.time.Duration ORPHAN_DEPENDENCY_AGE = java.time.Duration.ofMinutes(10);
+
     /** New tasks waiting to start, oldest first, that nothing has taken up yet. */
     List<Task> awaitingAdmission() {
         List<Task> all = tasks.listTasks();
@@ -842,6 +992,12 @@ public class TaskService implements TaskRecovery {
         waiting.forEach(t -> ids.add(t.id()));
         String company = TenantContext.require();
         admitted.entrySet().removeIf(e -> company.equals(e.getValue()) && !ids.contains(e.getKey())); // started, stopped or deleted since
+        if (dependencies != null) {
+            // Only tasks whose dependencies are all done; the limits below apply to those as before.
+            Map<String, Task> byId = new HashMap<>();
+            all.forEach(t -> byId.put(t.id(), t));
+            waiting = dependencies.ready(waiting, byId, this::finished, now -> now.minus(ORPHAN_DEPENDENCY_AGE));
+        }
         Map<String, String> parents = parentsOf();
         Map<String, Integer> room = new HashMap<>();
         List<Task> out = new ArrayList<>();
@@ -1163,11 +1319,10 @@ public class TaskService implements TaskRecovery {
             }
         }
         runStates.delete(task.id());
-        if (TaskKind.fromStorage(task.flow()) == TaskKind.CODING) {
-            codingFlow.persist(task.id(), CodingFlow.initialPhases());
-        }
+        boolean harnessed = harnessFor(task) != null; // a complex task's record doesn't make it resume mid-way
         runStore.appendEvent(AgentEvent.of(task.id(), Long.MAX_VALUE, AgentEventType.SYSTEM,
-                "在 " + task.model() + " 上失败，改用更贵的 " + up.model() + " 从头重新执行。"));
+                "在 " + task.model() + " 上失败，改用更贵的 " + up.model()
+                        + (harnessed ? " 从出错的那一步接着做。" : " 从头重新执行。")));
         Task again = task.requeuedOn(up.model(), AgentType.fromString(up.cli()), up.tier());
         tasks.save(again);
         publish(again, null);
@@ -1259,6 +1414,19 @@ public class TaskService implements TaskRecovery {
     /** {@code fileIds}: files the user uploaded for this message (see FileService#upload); they go into the workspace. */
     public void sendMessage(String id, String owner, String text, List<ImageUploadDto> uploads, List<String> fileIds) {
         Task task = require(id, owner);
+        if (task.status() == TaskStatus.NEEDS_CONFIRMATION && task.workspaceDir() == null) {
+            // Held before it started (a confirmation taken back): the owner's yes lets it go.
+            Task pending = task.withStatus(TaskStatus.PENDING);
+            tasks.save(pending);
+            publish(pending, null);
+            Runnable wake = wakeScheduler;
+            if (wake != null) {
+                wake.run();
+            } else {
+                admit(pending);
+            }
+            return;
+        }
         if (task.status() == TaskStatus.RUNNING || task.workspaceDir() == null) {
             throw new TaskBusyException(id); // running, or queued and never started
         }
@@ -1377,6 +1545,26 @@ public class TaskService implements TaskRecovery {
         }
     }
 
+    /**
+     * Takes a task that has not started back to waiting for its owner (NEEDS_CONFIRMATION); the owner's next
+     * confirmation (any message) lets it start, see {@link #sendMessage}. Refused once it has started.
+     */
+    public void holdForConfirmation(String id, String owner) {
+        Task task = require(id, owner);
+        if (task.status() != TaskStatus.PENDING || task.workspaceDir() != null) {
+            throw new TaskBusyException(id);
+        }
+        synchronized (schedulerLock) {
+            Deque<QueuedRun> q = queues.get(task.createdBy());
+            if (q != null) {
+                q.removeIf(r -> r.taskId().equals(id));
+            }
+        }
+        Task held = task.withStatus(TaskStatus.NEEDS_CONFIRMATION);
+        tasks.save(held);
+        publish(held, null);
+    }
+
     /** Soft delete: marks the task DELETED so it drops out of the list; the row is kept. */
     public void delete(String id, String owner) {
         Task task = require(id, owner);
@@ -1397,6 +1585,10 @@ public class TaskService implements TaskRecovery {
             pool.dropReservation(id);    // a reservation it held while another task ran in the session
         }
         nextTurnImages.remove(id);
+        com.superagent.task.harness.TaskHarness harness = harnesses.get(task.flow());
+        if (harness != null && task.status() != TaskStatus.RUNNING) {
+            harnessState(id).ifPresent(harness::discard); // its worktree or clone; a running one is cleaned up when it stops
+        }
         tasks.save(task.withStatus(TaskStatus.DELETED));
         tryDispatch(task.createdBy());
     }
@@ -1422,11 +1614,15 @@ public class TaskService implements TaskRecovery {
         if (task == null || (task.status() != TaskStatus.RUNNING && task.status() != TaskStatus.ERROR)) {
             return;
         }
-        if (activeRuns.containsKey(id)) {
-            return; // actually executing here; healthy
+        if (activeRuns.containsKey(id) || shuttingDown) {
+            return; // actually executing here; healthy (or the server is going down: the next start resumes it)
         }
 
         TaskRunState state = runStates.find(id).orElseGet(() -> TaskRunState.initial(id, deriveSessionId(task)));
+        if (state.interruptedByRestart() && task.status() == TaskStatus.RUNNING) {
+            resumeAfterRestart(task, state);
+            return;
+        }
         if (state.attemptCount() >= MAX_ATTEMPTS) {
             if (task.status() != TaskStatus.ERROR) {
                 Task failed = task.finished(TaskStatus.ERROR, task.progress(),
@@ -1474,6 +1670,28 @@ public class TaskService implements TaskRecovery {
         executor.execute(TenantContext.wrap(() -> recoverRun(running, sid, ft)));
     }
 
+    /** A run the last shutdown cut short: picked up on its own conversation, and not counted as a retry. */
+    private void resumeAfterRestart(Task task, TaskRunState state) {
+        boolean fresh = state.agentSessionId() == null || state.agentSessionId().isBlank(); // its first turn never ran
+        String sessionId = fresh ? UUID.randomUUID().toString() : state.agentSessionId();
+        synchronized (schedulerLock) {
+            TaskSessionPool.Session bound = pool.sessionForTask(task.id());
+            if (bound != null && !fresh) {
+                pool.resumeBusy(bound);
+                sessionId = bound.id;
+            } else {
+                pool.adopt(task.createdBy(), task.agentType(), task.id(), sessionId, task.workspaceDir(), !fresh).model = task.model();
+            }
+        }
+        runStates.save(fresh ? new TaskRunState(task.id(), sessionId, state.failureCount(), state.attemptCount(), Instant.now())
+                : state.resumedAfterRestart());
+        runStore.appendEvent(AgentEvent.of(task.id(), Long.MAX_VALUE, AgentEventType.SYSTEM, "服务已重启，从中断处继续。"));
+        String sid = sessionId;
+        log.info("resuming task {} interrupted by the restart (session {}, attempt {} — not counted)",
+                task.id(), sid, state.attemptCount());
+        executor.execute(TenantContext.wrap(() -> recoverRun(task, sid, fresh)));
+    }
+
     /** The pool session id equals the workspace dir's name (see TaskSessionPool), so it is recoverable without extra state. */
     private String deriveSessionId(Task task) {
         if (task.workspaceDir() == null || task.workspaceDir().isBlank()) {
@@ -1487,12 +1705,11 @@ public class TaskService implements TaskRecovery {
      * given the task again (and a coding task its PRD and the step it is on), never just "carry on".
      */
     private void recoverRun(Task task, String sessionId, boolean freshSession) {
-        if (TaskKind.fromStorage(task.flow()) == TaskKind.CODING) {
-            String prompt = codingFlow.resumePrompt(codingFlow.load(task.id()), task.brief(), freshSession);
-            if (prompt != null) {
-                run(task, prompt, sessionId, freshSession, false);
-                return;
-            }
+        com.superagent.task.harness.TaskHarness harness = harnessFor(task);
+        if (harness != null) {
+            harnessState(task.id()).ifPresent(st -> harness.afterRestart(task, st, harnessHost));
+            run(task, task.brief(), sessionId, freshSession, true); // the harness picks up at the step it stopped on
+            return;
         }
         if (!freshSession) {
             run(task, RESUME_NOTE, sessionId, false, false);
@@ -1512,23 +1729,104 @@ public class TaskService implements TaskRecovery {
 
     /** Dispatches a scheduled turn: coding tasks run the fixed PRD→develop→verify flow, others run single-pass. */
     private void run(Task task, String prompt, String agentSessionId, boolean sessionFirstTurn, boolean wrapBriefPrompt) {
+        if (shuttingDown) {
+            // Started as the server went down: the next start runs it. A first turn never opened its conversation.
+            if (sessionFirstTurn) {
+                markInterruptedBeforeItsConversation(task.id());
+            } else {
+                markInterrupted(task.id());
+            }
+            return;
+        }
         Cancellation cancellation = new Cancellation();
         activeRuns.put(task.id(), cancellation);
+        TenantContext.current().ifPresent(c -> activeCompanies.put(task.id(), c));
         try {
-            boolean coding = TaskKind.fromStorage(task.flow()) == TaskKind.CODING;
-            if (coding && !wrapBriefPrompt && CodingFlow.currentIndex(codingFlow.load(task.id())) >= codingFlow.load(task.id()).size()) {
-                // Rework on a finished coding task: every phase is done, so there's no phase to resume —
-                // without this the message would settle DONE without the agent ever seeing it.
-                runFollowUp(task, prompt, agentSessionId, sessionFirstTurn, cancellation);
-            } else if (coding) {
-                // wrapBrief=true marks the initial execution (run phases from the start); false is a
-                // post-confirmation resume carrying the user's reply for the current phase.
-                runCoding(task, wrapBriefPrompt ? null : prompt, agentSessionId, sessionFirstTurn, cancellation);
+            com.superagent.task.harness.TaskHarness harness = harnessFor(task);
+            if (harness != null) {
+                // wrapBrief=true is a first or recovered run; false carries the user's reply to the step it waits on.
+                driveHarness(task, harness, wrapBriefPrompt ? null : prompt, agentSessionId, sessionFirstTurn, cancellation);
             } else {
                 runTurn(task, prompt, agentSessionId, sessionFirstTurn, wrapBriefPrompt, cancellation);
             }
         } finally {
-            activeRuns.remove(task.id(), cancellation);
+            if (activeRuns.remove(task.id(), cancellation)) {
+                activeCompanies.remove(task.id());
+            }
+            synchronized (activeRuns) {
+                activeRuns.notifyAll();
+            }
+        }
+    }
+
+    // --- shutdown ---
+
+    /** The server is going down: no new run starts here, and the watchdog leaves tasks alone. */
+    void beginShutdown() {
+        shuttingDown = true;
+    }
+
+    /** Waits up to {@code timeout} for the running turns to end on their own; true when none is left. */
+    boolean awaitIdle(java.time.Duration timeout) throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        synchronized (activeRuns) {
+            while (!activeRuns.isEmpty()) {
+                long left = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+                if (left <= 0) {
+                    return false;
+                }
+                activeRuns.wait(Math.min(left, 200));
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Cuts short every run still going: each is marked as interrupted by the restart (so the next start resumes it
+     * at once, without spending its retry budget) and noted in its run log; then {@code endProcesses} runs (before
+     * the turns are cancelled, which would kill only the CLI and orphan its children) and the turns are stopped.
+     */
+    Set<String> interruptRemaining(Runnable endProcesses) {
+        Set<String> ids = Set.copyOf(activeRuns.keySet());
+        for (String id : ids) {
+            String company = activeCompanies.get(id);
+            Runnable mark = () -> {
+                markInterrupted(id);
+                runStore.appendEvent(AgentEvent.of(id, Long.MAX_VALUE, AgentEventType.SYSTEM,
+                        "服务重启，这一轮执行被中断；服务启动后会从中断处自动继续（不计入重试次数）。"));
+            };
+            if (company != null) {
+                TenantContext.run(company, mark);
+            } else {
+                mark.run();
+            }
+        }
+        endProcesses.run();
+        for (String id : ids) {
+            Cancellation c = activeRuns.get(id);
+            if (c != null) {
+                c.cancel();
+            }
+        }
+        if (!ids.isEmpty()) {
+            log.warn("shutdown: interrupted {} running task(s): {}", ids.size(), ids);
+        }
+        return ids;
+    }
+
+    /** No conversation to resume: the restart starts one (an interrupted state without a session says so). */
+    private void markInterruptedBeforeItsConversation(String id) {
+        interruptedByShutdown.add(id);
+        TaskRunState state = runStates.find(id).orElseGet(() -> TaskRunState.initial(id, null));
+        runStates.save(new TaskRunState(id, null, state.failureCount(), state.attemptCount(), Instant.now(), true));
+    }
+
+    private void markInterrupted(String id) {
+        interruptedByShutdown.add(id);
+        TaskRunState state = runStates.find(id).orElseGet(() -> tasks.findTask(id)
+                .map(t -> TaskRunState.initial(id, boundSessionId(t))).orElse(null));
+        if (state != null) {
+            runStates.save(state.interruptedByRestart(null));
         }
     }
 
@@ -1550,11 +1848,18 @@ public class TaskService implements TaskRecovery {
     /** {@code label}: what the turn is, for its timing (a coding phase's key), or null. */
     private TurnResult executeTurn(Task task, String prompt, String agentSessionId, boolean sessionFirstTurn,
                                    boolean wrapBriefPrompt, Runnable onToolUse, Cancellation cancellation, String label) {
+        return executeTurn(task, prompt, agentSessionId, sessionFirstTurn, wrapBriefPrompt, onToolUse, cancellation, label, false);
+    }
+
+    /** {@code readOnly}: a turn that only judges (an independent check): read-only tools, no file, MCP or connector tools. */
+    private TurnResult executeTurn(Task task, String prompt, String agentSessionId, boolean sessionFirstTurn,
+                                   boolean wrapBriefPrompt, Runnable onToolUse, Cancellation cancellation, String label,
+                                   boolean readOnly) {
         com.superagent.core.timing.TurnTimer timer = new com.superagent.core.timing.TurnTimer();
         String turnId = UUID.randomUUID().toString();
         try {
             return timedTurn(task, prompt, agentSessionId, sessionFirstTurn, wrapBriefPrompt, onToolUse, cancellation,
-                    timer, turnId);
+                    timer, turnId, readOnly);
         } finally {
             if (timings != null) {
                 try {
@@ -1568,7 +1873,7 @@ public class TaskService implements TaskRecovery {
 
     private TurnResult timedTurn(Task task, String prompt, String agentSessionId, boolean sessionFirstTurn,
                                  boolean wrapBriefPrompt, Runnable onToolUse, Cancellation cancellation,
-                                 com.superagent.core.timing.TurnTimer timer, String messageId) {
+                                 com.superagent.core.timing.TurnTimer timer, String messageId, boolean readOnly) {
         AgentRunner runner = runners.get(task.agentType());
         if (runner == null) {
             throw new IllegalStateException("No runner for agent type " + task.agentType());
@@ -1609,11 +1914,11 @@ public class TaskService implements TaskRecovery {
         // agentSessionId is the pool session's id: --session-id on its first turn, --resume after,
         // so a reused session keeps its accumulated context. Events are re-keyed to task.id above.
         // A per-turn token gives this run the file and skill tools for its owner only, revoked after the turn.
-        McpGrants.Grant grant = mcpGrants == null || task.workspaceDir() == null ? null
+        McpGrants.Grant grant = readOnly || mcpGrants == null || task.workspaceDir() == null ? null
                 : mcpGrants.openTask(task.createdBy(), task.id(), task.workspaceDir());
         // The company's connectors, with the identity of whoever created the task (their own authorizations).
-        List<McpServerSpec> connected = connectors == null ? List.of() : connectors.mcpServersFor(task.createdBy());
-        List<String> tools = allowedTools;
+        List<McpServerSpec> connected = readOnly || connectors == null ? List.of() : connectors.mcpServersFor(task.createdBy());
+        List<String> tools = readOnly ? READ_ONLY_TOOLS : allowedTools;
         if (grant != null || !connected.isEmpty()) {
             tools = new ArrayList<>(allowedTools);
             if (grant != null) {
@@ -1633,7 +1938,7 @@ public class TaskService implements TaskRecovery {
                         // a reused conversation holds the tasks before it: say where this one starts (coding: runCoding)
                         : sessionFirstTurn ? wrapBrief(task, prompt) : NEW_TASK_NOTE + "\n\n" + wrapBrief(task, prompt),
                 effectiveModel(task),
-                tools, skipPermissions, McpGrants.withServers(grant == null ? null : mcpGrants.mcpConfig(grant), connected),
+                tools, skipPermissions && !readOnly, McpGrants.withServers(grant == null ? null : mcpGrants.mcpConfig(grant), connected),
                 taskSystemPrompt(task, grant != null),
                 nextTurnImages.remove(task.id()), null, choice.credential());
         try {
@@ -1717,10 +2022,59 @@ public class TaskService implements TaskRecovery {
         } else if (isComplex(task) && handedOutWork(task)) {
             // Its subtasks run (some may already be done); it sums up once they all are.
             settle(task, TaskStatus.WAITING, 50, null, turn.cost());
+        } else if (isComplex(task) && general() != null && harnessState(task.id()).isPresent()) {
+            concludeComplex(task, turn, agentSessionId, cancellation);
         } else {
             writeOutput(task, turn.finalText());
             settle(task, TaskStatus.DONE, 100, null, turn.cost());
         }
+    }
+
+    /**
+     * A complex task's conclusion is checked like a general task's work before it is delivered: a failed check sends
+     * it back for another summing-up turn (in its own session), a couple of times at most.
+     */
+    private void concludeComplex(Task task, TurnResult turn, String agentSessionId, Cancellation cancellation) {
+        com.superagent.task.harness.general.GeneralHarness general = general();
+        com.superagent.task.harness.HarnessState state = harnessState(task.id()).orElseThrow();
+        com.superagent.task.harness.HarnessRun run = new com.superagent.task.harness.HarnessRun(harnessHost, task, state, null,
+                cancellation);
+        String again;
+        try {
+            again = general.checkSummary(run, turn.finalText());
+        } catch (RuntimeException e) {
+            failTurn(task, 90, e);
+            return;
+        }
+        if (run.settled()) {
+            return; // stopped while checking
+        }
+        if (again != null) {
+            addSpend(task.id(), turn.cost());
+            runStore.appendMessage(new ChatMessage(UUID.randomUUID().toString(), task.id(), MessageRole.USER, again, Instant.now()));
+            runTurn(task, again, agentSessionId, false, false, cancellation);
+            return;
+        }
+        String output = com.superagent.task.harness.general.GeneralHarness.summaryOutput(state, turn.finalText());
+        // The checker's words were the last said: the conclusion is what the task came to.
+        lastReply.put(task.id(), output);
+        runStore.appendMessage(new ChatMessage(UUID.randomUUID().toString(), task.id(), MessageRole.ASSISTANT, output, Instant.now()));
+        writeOutput(task, output);
+        settle(task, TaskStatus.DONE, 100, null, turn.cost());
+    }
+
+    private com.superagent.task.harness.general.GeneralHarness general() {
+        return harnesses.get(com.superagent.task.harness.general.GeneralHarness.KIND)
+                instanceof com.superagent.task.harness.general.GeneralHarness g ? g : null;
+    }
+
+    /**
+     * The harness a task runs under, if any. One that runs in the task's own session only takes tasks created with
+     * its state: a general task from before it keeps running single-pass.
+     */
+    private com.superagent.task.harness.TaskHarness harnessFor(Task task) {
+        com.superagent.task.harness.TaskHarness h = harnesses.get(task.flow());
+        return h == null || h.usesTaskSession() && harnessState(task.id()).isEmpty() ? null : h;
     }
 
     /**
@@ -1731,97 +2085,416 @@ public class TaskService implements TaskRecovery {
         return isComplex(task) || isSubtask(task.id());
     }
 
+    // --- harness-run tasks ---
+
     /**
-     * Backend-enforced coding flow: PRD → develop → verify, each a resumed turn on the
-     * same session. Resumes at the first non-DONE phase, so a post-confirmation reply
-     * (passed as {@code resumePrompt}) continues the phase it paused on. Gates: the PRD
-     * step must produce PRD content (one auto-retry), and the verify step must produce
-     * evidence, else the task pauses at NEEDS_CONFIRMATION with the reason.
+     * Where this user's coding tasks can work, for the agent filling in the confirm table: the admin's directories, the
+     * repositories under them, the ones the user used lately, and which code hosts the user has authorized.
      */
-    private void runCoding(Task task, String resumePrompt, String agentSessionId,
-                           boolean sessionFirstTurn, Cancellation cancellation) {
-        List<TaskPhase> phases = new ArrayList<>(codingFlow.load(task.id()));
-        int start = CodingFlow.currentIndex(phases);
-        boolean firstTurn = sessionFirstTurn;
-        try {
-            for (int i = start; i < phases.size(); i++) {
-                TaskPhase phase = phases.get(i).withStatus(TaskPhaseStatus.RUNNING);
-                phases.set(i, phase);
-                codingFlow.persist(task.id(), phases);
-                persistProgress(task.id(), CodingFlow.runningProgress(i));
-
-                String prompt = (i == start && resumePrompt != null)
-                        ? resumePrompt : codingFlow.prompt(phase.key(), task.brief());
-                if (i == start && resumePrompt == null && !sessionFirstTurn) {
-                    prompt = NEW_TASK_NOTE + "\n\n" + prompt; // a reused conversation: this task starts here
-                }
-                TurnResult turn = executeTurn(task, prompt, agentSessionId, firstTurn, false, null, cancellation, phase.key());
-                firstTurn = false;
-                addSpend(task.id(), turn.cost());
-
-                if (turn.cancelled()) {
-                    settle(task, TaskStatus.STOPPED, CodingFlow.runningProgress(i), null, BigDecimal.ZERO);
-                    return;
-                }
-                if (turn.needsConfirmation()) {
-                    settle(task, TaskStatus.NEEDS_CONFIRMATION, CodingFlow.runningProgress(i), null, BigDecimal.ZERO);
-                    return; // phase stays RUNNING; a user reply resumes it here
-                }
-
-                if (CodingFlow.PRD.equals(phase.key())) {
-                    String prd = CodingFlow.isPrd(turn.finalText()) ? turn.finalText() : null;
-                    if (prd == null) {
-                        TurnResult retry = executeTurn(task, CodingFlow.PRD_RETRY_PROMPT, agentSessionId, false, false, null, cancellation, phase.key());
-                        addSpend(task.id(), retry.cost());
-                        if (retry.cancelled()) {
-                            settle(task, TaskStatus.STOPPED, CodingFlow.runningProgress(i), null, BigDecimal.ZERO);
-                            return;
-                        }
-                        prd = CodingFlow.isPrd(retry.finalText()) ? retry.finalText() : null;
-                        if (prd == null) {
-                            pauseForGate(task, phases, i, "第1步未产出 PRD");
-                            return;
-                        }
-                    }
-                    phase = phase.withContent(prd);
-                } else if (CodingFlow.ACCEPT.equals(phase.key())) {
-                    String evidence = firstNonBlank(turn.finalText());
-                    if (evidence == null) {
-                        pauseForGate(task, phases, i, "缺少验收证据");
-                        return;
-                    }
-                    phase = phase.withEvidence(evidence);
-                }
-
-                phase = phase.withStatus(TaskPhaseStatus.DONE);
-                phases.set(i, phase);
-                codingFlow.persist(task.id(), phases);
-                persistProgress(task.id(), CodingFlow.doneProgress(i));
-            }
-        } catch (Exception e) {
-            codingFlow.persist(task.id(), phases);
-            failTurn(task, task.progress(), e);
-            return;
+    public String codingTargets(String owner, String agentId) {
+        StringBuilder sb = new StringBuilder();
+        List<com.superagent.core.project.ProjectRepo> projectRepos = projects == null ? List.of() : projects.reposOfAgent(agentId);
+        if (!projectRepos.isEmpty()) {
+            sb.append("本项目的仓库（项目内的编码任务优先用这些；一个任务只改一个仓库，要改多个仓库就每个仓库建一个子任务）：\n");
+            projectRepos.forEach(r -> sb.append("- ").append(r.name()).append("：").append(r.location())
+                    .append("（默认分支 ").append(r.defaultBranch() == null ? "仓库默认" : r.defaultBranch())
+                    .append("，交付方式 ").append(r.delivery()).append("）")
+                    .append(r.purpose() == null ? "" : " 用途：" + r.purpose()).append("\n"));
         }
-        writeOutput(task, phases.get(phases.size() - 1).evidence());
-        settle(task, TaskStatus.DONE, 100, null, BigDecimal.ZERO);
+        List<Path> roots = harnessHost.localRoots();
+        if (roots.isEmpty()) {
+            sb.append("本地代码目录：管理员没有开放（只能用远程 git 仓库地址；要用本地仓库请管理员在「系统设置 → 编码任务」里加目录）\n");
+        } else {
+            sb.append("允许的本地代码目录：").append(roots.stream().map(Path::toString).collect(java.util.stream.Collectors.joining("、"))).append("\n");
+            List<String> repos = new ArrayList<>();
+            for (Path root : roots) {
+                gitReposUnder(root, 2, repos);
+            }
+            sb.append("其中的 git 仓库：").append(repos.isEmpty() ? "没找到" : String.join("、", repos)).append("\n");
+        }
+        List<String> recent = tasks.listTasks().stream()
+                .filter(t -> owner.equals(t.createdBy()) && TaskKind.CODING.storageName().equals(t.flow()) && t.repo() != null)
+                .sorted(Comparator.comparing(Task::createdAt).reversed()).map(Task::repo).distinct().limit(5).toList();
+        sb.append("最近用过的代码位置：").append(recent.isEmpty() ? "无" : String.join("、", recent)).append("\n");
+        boolean github = harnessHost.connectorToken("github", owner).isPresent();
+        String gitlab = harnessHost.connectorSite("gitlab", owner).orElse(null);
+        sb.append("已授权：GitHub ").append(github ? "是" : "否（远程仓库开 PR 需要先在「连接」页授权）")
+                .append("；GitLab ").append(gitlab != null ? "是（" + gitlab + "）" : "否").append("\n");
+        return sb.toString();
     }
 
-    /** Pauses a coding task at NEEDS_CONFIRMATION, surfacing a gate reason into the visible stream. */
-    private void pauseForGate(Task task, List<TaskPhase> phases, int phaseIndex, String reason) {
-        codingFlow.persist(task.id(), phases); // current phase stays RUNNING, so a reply resumes it
-        String text = CONFIRM_MARKER + ": " + reason;
-        runStore.appendEvent(AgentEvent.of(task.id(), Long.MAX_VALUE, AgentEventType.TEXT, text));
-        runStore.appendMessage(new ChatMessage(UUID.randomUUID().toString(), task.id(),
-                MessageRole.ASSISTANT, text, Instant.now()));
-        settle(task, TaskStatus.NEEDS_CONFIRMATION, CodingFlow.runningProgress(phaseIndex), null, BigDecimal.ZERO);
+    private static void gitReposUnder(Path dir, int depth, List<String> out) {
+        if (out.size() >= 15 || !java.nio.file.Files.isDirectory(dir)) {
+            return;
+        }
+        if (java.nio.file.Files.exists(dir.resolve(".git"))) {
+            out.add(dir.toString());
+            return;
+        }
+        if (depth == 0) {
+            return;
+        }
+        try (java.util.stream.Stream<Path> kids = java.nio.file.Files.list(dir)) {
+            kids.filter(java.nio.file.Files::isDirectory).filter(p -> !p.getFileName().toString().startsWith("."))
+                    .sorted().forEach(p -> gitReposUnder(p, depth - 1, out));
+        } catch (java.io.IOException e) {
+            // an unreadable directory has no repositories to offer
+        }
+    }
+
+    private java.util.Optional<com.superagent.task.harness.HarnessState> harnessState(String taskId) {
+        return phaseStore.findPhasesJson(taskId).filter(com.superagent.task.harness.HarnessState::isState)
+                .map(com.superagent.task.harness.HarnessState::fromJson);
+    }
+
+    private void driveHarness(Task task, com.superagent.task.harness.TaskHarness harness, String reply,
+                              String agentSessionId, boolean sessionFirstTurn, Cancellation cancellation) {
+        com.superagent.task.harness.HarnessState state = harnessState(task.id()).orElseGet(() -> {
+            com.superagent.task.harness.HarnessState s = harness.start(task, null);
+            phaseStore.save(task.id(), s.toJson());
+            return s;
+        });
+        if (harness.usesTaskSession()) {
+            state.conversation = agentSessionId; // the pool's session: it changes when the task moves to a new one
+            state.conversationStarted = !sessionFirstTurn;
+        }
+        if (state.finished() && reply != null && !harness.reopens()) {
+            String text = "这个任务已经交付了（" + (state.deliveryNote == null ? "已完成" : state.deliveryNote)
+                    + "）。要接着改，请在任务上点「接续」新建一个任务，它会从这次的结果开始。";
+            runStore.appendMessage(new ChatMessage(UUID.randomUUID().toString(), task.id(), MessageRole.ASSISTANT, text, Instant.now()));
+            settle(task, TaskStatus.DONE, 100, null, BigDecimal.ZERO);
+            return;
+        }
+        // The harness works in its own directory (a worktree or clone), which the session pool never sees: the task
+        // row keeps the pool's workspace, so no other task can be scheduled into this one.
+        Task working = state.dir == null ? task : task.withWorkspaceDir(state.dir);
+        harness.drive(new com.superagent.task.harness.HarnessRun(harnessHost, working, state, reply, cancellation));
+    }
+
+    private final com.superagent.task.harness.HarnessHost harnessHost = new com.superagent.task.harness.HarnessHost() {
+        @Override
+        public Turn turn(Task task, String prompt, String conversation, boolean first, String label, Cancellation c) {
+            if (shuttingDown) {
+                markInterrupted(task.id()); // the next step waits for the restart instead of starting now
+                return new Turn(null, BigDecimal.ZERO, true);
+            }
+            TurnResult r = executeTurn(task, prompt, conversation, first, false, null, c, label);
+            addSpend(task.id(), r.cost());
+            return new Turn(r.finalText(), r.cost(), r.cancelled());
+        }
+
+        @Override
+        public Turn turnOn(Task task, Model model, String prompt, String conversation, String label, Cancellation c) {
+            Task on = model == null || !runners.containsKey(AgentType.fromString(model.cli())) ? task
+                    : task.withModel(model.model(), AgentType.fromString(model.cli()), task.tier());
+            // It judges what it's shown: it may read, never change the work or reach out (files, MCP, connectors).
+            TurnResult r = executeTurn(on, prompt, conversation, true, false, null, c, label, true);
+            addSpend(task.id(), r.cost());
+            return new Turn(r.finalText(), r.cost(), r.cancelled());
+        }
+
+        @Override
+        public java.util.Optional<Model> checkerModel(Task task) {
+            if (selector == null) {
+                return java.util.Optional.empty();
+            }
+            // Another model than the one that did the work where there is one: the cheapest of them.
+            Set<String> clis = runners.keySet().stream().map(AgentType::cliName).collect(java.util.stream.Collectors.toSet());
+            var choice = selector.checker(tasks.findTask(task.id()).orElse(task), clis)
+                    .filter(c -> c.model() != null && c.cli() != null && runners.containsKey(AgentType.fromString(c.cli())));
+            choice.ifPresent(TaskService.this::recordChoice);
+            return choice.map(c -> new Model(c.model(), c.cli()));
+        }
+
+        @Override
+        public String brief(Task task, boolean first) {
+            String wrapped = wrapBrief(task, task.brief()).replace(SELF_CHECK, PLATFORM_CHECK);
+            return first ? wrapped : NEW_TASK_NOTE + "\n\n" + wrapped;
+        }
+
+        @Override
+        public boolean onItsOwn(Task task) {
+            return TaskService.this.onItsOwn(task);
+        }
+
+        @Override
+        public com.superagent.core.proxyconfirm.ProxyConfirmGate.Decision proxyDecide(Task task,
+                com.superagent.core.proxyconfirm.ConfirmType type, java.util.Map<String, Object> facts) {
+            return proxyConfirmGate == null ? com.superagent.core.proxyconfirm.ProxyConfirmGate.Decision.refer(null)
+                    : proxyConfirmGate.decide(task.createdBy(), projectOf(task).orElse(null), type, "task", task.id(), facts);
+        }
+
+        @Override
+        public com.superagent.core.writing.StyleLexicon styleLexicon() {
+            return styleGuide == null ? null : styleGuide.lexicon();
+        }
+
+        @Override
+        public List<Produced> produced(Task task) {
+            return producedFiles(task);
+        }
+
+        @Override
+        public Materials materials(Task task) {
+            return materialsOf(task);
+        }
+
+        @Override
+        public Task workIn(Task task, String dir) {
+            return task.withWorkspaceDir(dir);
+        }
+
+        @Override
+        public void progress(Task task, int percent) {
+            persistProgress(task.id(), percent);
+        }
+
+        @Override
+        public void note(Task task, String text) {
+            runStore.appendEvent(AgentEvent.of(task.id(), Long.MAX_VALUE, AgentEventType.SYSTEM, text));
+        }
+
+        @Override
+        public void ask(Task task, String text) {
+            String line = CONFIRM_MARKER + ": " + text;
+            runStore.appendEvent(AgentEvent.of(task.id(), Long.MAX_VALUE, AgentEventType.TEXT, line));
+            runStore.appendMessage(new ChatMessage(UUID.randomUUID().toString(), task.id(), MessageRole.ASSISTANT, line,
+                    Instant.now()));
+            lastReply.put(task.id(), text); // what the chat that set it off is told it waits on
+        }
+
+        @Override
+        public void tell(Task task, String text) {
+            note(task, text);
+            if (events != null && !isSubtask(task.id())) {
+                events.publishEvent(new NoticeEvents.TaskNote(task.id(), task.createdBy(), task.title(), text));
+            }
+        }
+
+        @Override
+        public void save(Task task, com.superagent.task.harness.HarnessState state) {
+            phaseStore.save(task.id(), state.toJson());
+        }
+
+        @Override
+        public void settle(Task task, TaskStatus status, int progress, String output, String error) {
+            settle(task, status, progress, output, error, false);
+        }
+
+        @Override
+        public void settle(Task task, TaskStatus status, int progress, String output, String error, boolean repeated) {
+            settle(task, status, progress, output, error, repeated, true);
+        }
+
+        @Override
+        public void settle(Task task, TaskStatus status, int progress, String output, String error, boolean repeated,
+                           boolean escalate) {
+            Task stored = tasks.findTask(task.id()).orElse(task);
+            if (output != null) {
+                writeOutput(stored, output);
+                lastReply.put(task.id(), output); // the delivered summary, not the reviewer's last words
+                runStore.appendMessage(new ChatMessage(UUID.randomUUID().toString(), task.id(), MessageRole.ASSISTANT,
+                        output, Instant.now()));
+            }
+            TaskService.this.settle(stored, status, progress, error, BigDecimal.ZERO, repeated, escalate);
+        }
+
+        @Override
+        public java.util.Optional<String> connectorToken(String connectorId, String owner) {
+            return connectors == null ? java.util.Optional.empty() : connectors.userToken(connectorId, owner);
+        }
+
+        @Override
+        public java.util.List<Path> localRoots() {
+            return settings == null ? java.util.List.of() : settings.codeRoots().stream().map(Path::of).toList();
+        }
+
+        @Override
+        public java.util.Optional<String> connectorSite(String connectorId, String owner) {
+            return connectors == null ? java.util.Optional.empty() : connectors.authorizedSite(connectorId, owner);
+        }
+
+        @Override
+        public Path workRoot() {
+            return com.superagent.core.tenant.TenantPaths.of(workspaceRoot);
+        }
+
+        @Override
+        public Path fetch(Task task, String fileId, Path dir) {
+            if (files == null) {
+                throw new IllegalStateException("no file service");
+            }
+            return dir.resolve(files.copyToWorkspace(fileId, task.createdBy(), dir));
+        }
+
+        @Override
+        public String deliver(Task task, Path file, String name, String replaceId, List<String> tags) {
+            if (files == null) {
+                throw new IllegalStateException("no file service");
+            }
+            return files.saveFrom(files.forTask(task.createdBy(), task.id()), file, name, replaceId, tags).id();
+        }
+
+        @Override
+        public java.util.Optional<String> projectOf(Task task) {
+            return projects == null ? java.util.Optional.empty() : projects.projectOfTask(task.id());
+        }
+
+        @Override
+        public void spent(Task task, BigDecimal usd) {
+            addSpend(task.id(), usd);
+        }
+
+        @Override
+        public Turn reviewTurn(Task task, Model model, String prompt, String conversation, String label, Cancellation c) {
+            AgentType type = model == null || model.cli() == null ? null : AgentType.fromString(model.cli());
+            Task on = type == null || !runners.containsKey(type) ? task : task.withModel(model.model(), type, task.tier());
+            return turn(on, prompt, conversation, true, label, c);
+        }
+
+        @Override
+        public java.util.Optional<com.superagent.core.task.TaskModelChoice> reviewer(Task task) {
+            if (selector == null) {
+                return java.util.Optional.empty();
+            }
+            Set<String> clis = runners.keySet().stream().map(AgentType::cliName).collect(java.util.stream.Collectors.toSet());
+            return selector.reviewer(tasks.findTask(task.id()).orElse(task),
+                    com.superagent.core.task.TaskModelSelector.ReviewPurpose.REVIEW, clis);
+        }
+
+        @Override
+        public void recordChoice(com.superagent.core.task.TaskModelChoice choice) {
+            TaskService.this.recordChoice(choice);
+        }
+
+        @Override
+        public BigDecimal spend(Task task) {
+            BigDecimal spent = tasks.findTask(task.id()).map(Task::spend).orElse(task.spend());
+            return spent == null ? BigDecimal.ZERO : spent;
+        }
+
+        @Override
+        public ReviewLimits reviewLimits() {
+            return settings == null ? new ReviewLimits(com.superagent.platform.settings.SettingsService.DEFAULT_REVIEW_MAX_ROUNDS,
+                    com.superagent.platform.settings.SettingsService.DEFAULT_REVIEW_MAX_SPEND)
+                    : new ReviewLimits(settings.codingReviewMaxRounds(), settings.codingReviewMaxSpend());
+        }
+    };
+
+    /** What an independent check may use: reading only (with permissions not skipped, nothing else runs). */
+    static final List<String> READ_ONLY_TOOLS = List.of("Read", "Grep", "Glob");
+    private static final String SELF_CHECK = "交付前自己检查一遍是否满足要求。";
+    private static final String PLATFORM_CHECK = "做完后平台会按验收清单独立检查。";
+    private static final java.util.regex.Pattern MATERIAL = java.util.regex.Pattern.compile("→ 文件 ([0-9a-f-]{36})（([^）]+)）");
+    private static final int PRODUCED_TEXT_BYTES = 2 * 1024 * 1024;
+
+    /** The files a task handed over (a complex task's include its subtasks'), with the text of the textual ones. */
+    private List<com.superagent.task.harness.HarnessHost.Produced> producedFiles(Task task) {
+        if (files == null) {
+            return List.of();
+        }
+        List<String> ids = new ArrayList<>(List.of(task.id()));
+        if (isComplex(task)) {
+            children(task.id()).forEach(k -> ids.add(k.id()));
+        }
+        List<com.superagent.task.harness.HarnessHost.Produced> out = new ArrayList<>();
+        for (String id : ids) {
+            for (com.superagent.api.file.WorkFileDto f : files.listForTask(task.createdBy(), id)) {
+                if (com.superagent.core.file.WorkFile.ORIGIN_UPLOAD.equals(f.origin())
+                        || com.superagent.core.file.WorkFile.LINK.equals(f.storage())) {
+                    continue; // what the user gave it, not what it made
+                }
+                out.add(new com.superagent.task.harness.HarnessHost.Produced(f.id(), f.name(), f.mimeType(), f.size(),
+                        textOf(f, task.createdBy())));
+            }
+        }
+        return out;
+    }
+
+    private String textOf(com.superagent.api.file.WorkFileDto f, String owner) {
+        String name = f.name().toLowerCase(java.util.Locale.ROOT);
+        boolean text = (f.mimeType() != null && f.mimeType().startsWith("text/"))
+                || name.matches(".*\\.(md|markdown|txt|csv|json|srt|vtt|html?|xml|ya?ml)$");
+        if (!text || f.size() > PRODUCED_TEXT_BYTES) {
+            return null;
+        }
+        try (java.io.InputStream in = files.content(f.id(), owner).resource().getInputStream()) {
+            return new String(in.readNBytes(PRODUCED_TEXT_BYTES), StandardCharsets.UTF_8);
+        } catch (IOException | RuntimeException e) {
+            log.debug("could not read file {} for the check: {}", f.id(), e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Whether a task got at its materials: the files its links were read into when it was created (named in its
+     * brief) should be in its workspace (file_get puts them in uploads/), and no read_link of its may have failed.
+     */
+    private com.superagent.task.harness.HarnessHost.Materials materialsOf(Task task) {
+        List<String> given = new ArrayList<>();
+        List<String> unfetched = new ArrayList<>();
+        java.util.regex.Matcher m = MATERIAL.matcher(task.brief() == null ? "" : task.brief());
+        Path uploads = task.workspaceDir() == null ? null : Path.of(task.workspaceDir(), FileService.UPLOADS_DIR);
+        List<String> there = new ArrayList<>();
+        if (uploads != null && Files.isDirectory(uploads)) {
+            try (var list = Files.list(uploads)) {
+                list.forEach(p -> there.add(p.getFileName().toString()));
+            } catch (IOException e) {
+                log.debug("could not list {}: {}", uploads, e.getMessage());
+            }
+        }
+        while (m.find()) {
+            String name = m.group(2);
+            given.add(name);
+            String stem = name.contains(".") ? name.substring(0, name.lastIndexOf('.')) : name;
+            if (there.stream().noneMatch(n -> n.startsWith(stem))) {
+                unfetched.add(name);
+            }
+        }
+        return new com.superagent.task.harness.HarnessHost.Materials(given, unfetched, unreadableLinks(runStore.listEvents(task.id())));
+    }
+
+    private static final java.util.regex.Pattern LINK_FAILED = java.util.regex.Pattern.compile("读不到 (\\S+?)：");
+    private static final java.util.regex.Pattern LINK_READ = java.util.regex.Pattern.compile("《[^》\\n]*》\\s*来源：(\\S+)");
+
+    /**
+     * The links whose last read_link failed: a link that failed once and was read afterwards (a retry, the next
+     * round) counts as read.
+     */
+    static List<String> unreadableLinks(List<AgentEvent> events) {
+        Map<String, String> last = new java.util.LinkedHashMap<>(); // link → the way it was last given
+        Map<String, Boolean> ok = new HashMap<>();
+        for (AgentEvent e : events) {
+            if (e.type() != AgentEventType.TOOL_RESULT || e.payload() == null) {
+                continue;
+            }
+            java.util.regex.Matcher read = LINK_READ.matcher(e.payload().strip());
+            java.util.regex.Matcher failed = LINK_FAILED.matcher(e.payload());
+            if (read.find()) {
+                ok.put(linkKey(read.group(1)), true);
+            } else if (failed.find()) {
+                last.put(linkKey(failed.group(1)), failed.group(1));
+                ok.put(linkKey(failed.group(1)), false);
+            }
+        }
+        return last.entrySet().stream().filter(x -> !ok.get(x.getKey())).map(Map.Entry::getValue).toList();
+    }
+
+    /** One link however it was written (the reader may hand back its address normalized). */
+    private static String linkKey(String url) {
+        return url.toLowerCase(java.util.Locale.ROOT).replaceFirst("^https?://", "").replaceFirst("[#].*$", "")
+                .replaceFirst("/+$", "");
     }
 
     private void failTurn(Task task, int progress, Exception e) {
+        if (interruptedByShutdown.contains(task.id())) {
+            return; // the turn broke because shutdown stopped it, not because it failed
+        }
         log.error("task {} failed", task.id(), e);
         String detail = e.getMessage() != null ? e.getMessage() : "task run failed";
         runStore.appendEvent(AgentEvent.of(task.id(), Long.MAX_VALUE, AgentEventType.ERROR, detail));
-        settle(task, TaskStatus.ERROR, progress, detail, BigDecimal.ZERO);
+        // An API client error repeats on any model; the next try already gets a fresh session (see recover).
+        settle(task, TaskStatus.ERROR, progress, detail, BigDecimal.ZERO, false, !ApiErrors.isClientError(detail));
     }
 
     private void persistProgress(String taskId, int progress) {
@@ -1850,8 +2523,23 @@ public class TaskService implements TaskRecovery {
      * any queued work now that a slot is free.
      */
     private void settle(Task task, TaskStatus status, int progress, String error, BigDecimal turnCost) {
+        settle(task, status, progress, error, turnCost, false);
+    }
+
+    /** {@code repeated}: a stop on the question the user was already told about (published as such, not told again). */
+    private void settle(Task task, TaskStatus status, int progress, String error, BigDecimal turnCost, boolean repeated) {
+        settle(task, status, progress, error, turnCost, repeated, true);
+    }
+
+    /** {@code escalate}: a failure may move the task up a tier; false when a stronger model wouldn't help. */
+    private void settle(Task task, TaskStatus status, int progress, String error, BigDecimal turnCost, boolean repeated,
+                        boolean escalate) {
+        if (interruptedByShutdown.contains(task.id())) {
+            log.info("task {} cut short by shutdown: stays RUNNING for the restart to resume", task.id());
+            return;
+        }
         Task latest = tasks.findTask(task.id()).orElse(task);
-        if (status == TaskStatus.ERROR) {
+        if (status == TaskStatus.ERROR && escalate) {
             BigDecimal spent = (latest.spend() == null ? BigDecimal.ZERO : latest.spend())
                     .add(turnCost == null ? BigDecimal.ZERO : turnCost);
             if (escalate(latest.withSpend(spent), error)) {
@@ -1864,8 +2552,13 @@ public class TaskService implements TaskRecovery {
         BigDecimal spend = (latest.spend() == null ? BigDecimal.ZERO : latest.spend())
                 .add(turnCost == null ? BigDecimal.ZERO : turnCost);
         tasks.save(next.withSpend(spend));
-        log.info("task {} -> {} ({}%), spend={}", task.id(), status, next.progress(), spend);
-        publish(next, null);
+        log.info("task {} -> {} ({}%), spend={}{}", task.id(), status, next.progress(), spend, repeated ? " (same question)" : "");
+        int attempts = runStates.find(task.id()).map(TaskRunState::attemptCount).orElse(1);
+        boolean retrying = status == TaskStatus.ERROR && attempts < MAX_ATTEMPTS;
+        String told = status == TaskStatus.ERROR && !retrying
+                ? "模型 " + next.model() + "，已重试 " + (attempts - 1) + " 次；最后错误：" + (error == null ? "未知" : error)
+                : next.error();
+        publish(next, null, repeated, retrying, told);
 
         synchronized (schedulerLock) {
             TaskSessionPool.Session session = pool.sessionForTask(task.id());
@@ -1894,15 +2587,26 @@ public class TaskService implements TaskRecovery {
 
     /** Tells the to-do page (and anyone else listening) the task's status; {@code agentId} only at creation. */
     private void publish(Task t, String agentId) {
+        publish(t, agentId, false);
+    }
+
+    private void publish(Task t, String agentId, boolean repeated) {
+        publish(t, agentId, repeated, false, t.error());
+    }
+
+    /** {@code retrying}: a failure the watchdog will retry; the chat hears of it only when the retries run out. */
+    private void publish(Task t, String agentId, boolean repeated, boolean retrying, String error) {
         if (events != null && !isSubtask(t.id())) {
             boolean settled = t.status() != TaskStatus.PENDING && t.status() != TaskStatus.RUNNING;
-            String result = t.status() == TaskStatus.DONE ? lastReply.get(t.id()) : null;
+            // Done: its answer; waiting on the user: its question.
+            String result = t.status() == TaskStatus.DONE || t.status() == TaskStatus.NEEDS_CONFIRMATION
+                    ? lastReply.get(t.id()) : null;
             if (settled) {
                 lastReply.remove(t.id());
             }
             events.publishEvent(new NoticeEvents.TaskStatusChanged(t.id(), t.createdBy(), t.title(),
-                    t.source().name().toLowerCase(Locale.ROOT), t.status().name().toLowerCase(Locale.ROOT), t.error(),
-                    agentId, result));
+                    t.source().name().toLowerCase(Locale.ROOT), t.status().name().toLowerCase(Locale.ROOT), error,
+                    agentId, result, repeated, retrying));
         }
     }
 
@@ -1922,8 +2626,38 @@ public class TaskService implements TaskRecovery {
     /** The task's skills index, plus how to hand over files when the run has the file tools. */
     private String taskSystemPrompt(Task task, boolean withTools) {
         String index = skills == null ? null : skills.install(task.workspaceDir(), skills.forTask(task.id(), task.createdBy()), withTools);
-        String prompt = join(doerPrompt(task), index);
-        return withTools ? join(prompt, McpGrants.FILES_HINT) : prompt;
+        String prompt = join(join(doerPrompt(task), projectPrompt(task)), index);
+        return withToolRules(join(prompt, styleGuidePrompt(task)), withTools);
+    }
+
+    /** The company's document standard, for every kind but writing (whose flow already carries its standards). */
+    String styleGuidePrompt(Task task) {
+        return styleGuide(styleGuide, task.flow(), task.title(), task.brief());
+    }
+
+    static String styleGuide(com.superagent.core.writing.StyleGuideSource source, String flow, String title, String brief) {
+        if (source == null || TaskKind.fromStorage(flow) == TaskKind.ARTICLE) {
+            return null;
+        }
+        boolean technical = com.superagent.core.writing.StyleGuideSource.looksTechnical(title + " " + brief);
+        return source.compactGuide(technical).orElse(null);
+    }
+
+    /** With the platform tools a run also learns how to hand results over and to settle what it learns. */
+    static String withToolRules(String prompt, boolean withTools) {
+        return withTools ? join(join(prompt, McpGrants.FILES_HINT), McpGrants.SETTLE_HINT) : prompt;
+    }
+
+    /**
+     * The shared context of the project this task is in (brief, index, memory), every turn: a reused session may have
+     * run another project's task before, and the context changes while the project goes on.
+     */
+    private String projectPrompt(Task task) {
+        if (projects == null) {
+            return null;
+        }
+        String agentId = taskAgents == null ? null : taskAgents.agentOf(task.id()).orElse(null);
+        return projects.context(agentId, task.id()).orElse(null);
     }
 
     /**
@@ -2006,11 +2740,13 @@ public class TaskService implements TaskRecovery {
 
     private String wrapBrief(String brief) {
         return """
-                你在执行一个任务。请先理解下面的任务说明，然后直接完成它；交付前自己检查一遍是否满足要求。
+                你在执行一个任务。请先理解下面的任务说明，然后直接完成它；""" + SELF_CHECK + "\n" + """
                 如果说明存在歧义，或有需要用户拍板才能继续的关键决策，不要擅自假设——请输出一行以 \
                 """ + CONFIRM_MARKER + """
-: 开头、后接你的具体问题，然后停止等待用户答复。用户会看到一个「确认继续」按钮，所以问题要写成能直接点确认的样子：\
-                写清你打算怎么做；有几个选项时列出来，并标出你推荐的那个（确认就按推荐的做）。否则请直接完成，并在结尾给出交付总结。
+: 开头、后接你的具体问题，然后停止等待用户答复。写清你打算怎么做；有几个选项时列出来，并标出你推荐的那个。\
+                问题最后单独一行写用户可以直接点的回复：👉 下一步：回复「…」或「…」（每个都会变成按钮，最多 3 个，第一个放推荐的）。\
+                卡在缺工具、缺权限、缺文件这类用户点「确认」也解决不了的事时，按钮写用户能做的事（例如「我上传逐字稿」「停止任务」），不要写「确认继续」。\
+                否则请直接完成，并在结尾给出交付总结。
                 资料里的链接用 read_link 读。资料读不到时，同样输出一行以 \
                 """ + CONFIRM_MARKER + """
 : 开头的话停下来，写明哪份资料读不到、原因和用户可以怎么解决；不要在没读到资料的情况下凭猜测继续写。
@@ -2067,6 +2803,7 @@ public class TaskService implements TaskRecovery {
         List<Task> kids = v.kids(t.id());
         String agentId = v.agentOf(t.id());
         com.superagent.core.task.TaskLink link = v.link(t.id());
+        TaskDependencies.Wait wait = waitOf(t, v);
         return new TaskDto(t.id(), t.title(), t.source().name().toLowerCase(),
                 t.repo(), t.branch(), t.flow(), t.status().name().toLowerCase(),
                 t.progress(), t.spend(), t.model(), t.createdBy(), t.error(),
@@ -2074,7 +2811,18 @@ public class TaskService implements TaskRecovery {
                 t.agentType().name().toLowerCase(), sessionId, t.workspaceDir(), sessionState(t.id(), sessionId), t.tier(),
                 originMessageId, link == null ? null : link.parentId(), link == null ? null : link.continuesFrom(),
                 v.tags(t.id()), agentId, agentId == null ? null : v.agentName(agentId),
-                kids.size(), (int) kids.stream().filter(this::finished).count(), v.totalSpend(t));
+                kids.size(), (int) kids.stream().filter(this::finished).count(), v.totalSpend(t), v.number(t.id()),
+                wait == null ? List.of() : TaskDependencies.refs(wait), wait == null ? null : TaskDependencies.blocked(wait));
+    }
+
+    /** What a task that hasn't started yet waits for; null for one that has, or that waits for nothing. */
+    private TaskDependencies.Wait waitOf(Task t, Views v) {
+        if (dependencies == null || t.status() != TaskStatus.PENDING || t.workspaceDir() != null) {
+            return null;
+        }
+        List<com.superagent.core.task.TaskDependency> deps = v.dependencies(t.id());
+        return deps.isEmpty() ? null
+                : TaskDependencies.wait(deps, d -> tasks.findTask(d).orElse(null), this::finished);
     }
 
     // --- relations and tags ---
@@ -2147,7 +2895,7 @@ public class TaskService implements TaskRecovery {
                         });
             }
         }
-        return new Views(byTask, kids, tagStore == null ? Map.of() : tagStore.all());
+        return new Views(byTask, kids, tagStore == null ? Map.of() : tagStore.all(), tasks.numbers());
     }
 
     /** As {@link #views()}, for one task only (a detail page polling its status). */
@@ -2160,7 +2908,7 @@ public class TaskService implements TaskRecovery {
                 kids.put(t.id(), children(t.id()));
             }
         }
-        return new Views(byTask, kids, tagStore == null ? Map.of() : Map.of(t.id(), tagStore.tags(t.id())));
+        return new Views(byTask, kids, tagStore == null ? Map.of() : Map.of(t.id(), tagStore.tags(t.id())), tasks.numbers());
     }
 
     private final class Views {
@@ -2169,15 +2917,31 @@ public class TaskService implements TaskRecovery {
         private final Map<String, List<String>> tags;
         private final Map<String, java.util.Optional<String>> agents = new HashMap<>();
         private final Map<String, String> names = new HashMap<>();
+        private final Map<String, Long> numbers;
 
-        Views(Map<String, com.superagent.core.task.TaskLink> links, Map<String, List<Task>> kids, Map<String, List<String>> tags) {
+        Views(Map<String, com.superagent.core.task.TaskLink> links, Map<String, List<Task>> kids, Map<String, List<String>> tags,
+              Map<String, Long> numbers) {
             this.links = links;
             this.kids = kids;
             this.tags = tags;
+            this.numbers = numbers;
+        }
+
+        Long number(String id) {
+            return numbers.get(id);
         }
 
         com.superagent.core.task.TaskLink link(String id) {
             return links.get(id);
+        }
+
+        private Map<String, List<com.superagent.core.task.TaskDependency>> waits;
+
+        List<com.superagent.core.task.TaskDependency> dependencies(String id) {
+            if (waits == null) {
+                waits = dependencies == null ? Map.of() : dependencies.byTask();
+            }
+            return waits.getOrDefault(id, List.of());
         }
 
         boolean isChild(String id) {
@@ -2237,8 +3001,93 @@ public class TaskService implements TaskRecovery {
         return new TaskEventDto(e.type().name().toLowerCase(), e.seq(), e.payload(), e.createdAt());
     }
 
-    private static TaskPhaseDto toPhaseDto(TaskPhase p) {
-        return new TaskPhaseDto(p.key(), p.name(), p.status().name().toLowerCase(), p.content(), p.evidence());
+    /**
+     * Employee handover: stop actively running tasks owned by {@code fromUserId}, then reassign
+     * {@code createdBy} to {@code toUserId}. {@link TaskStatus#PENDING} / {@link TaskStatus#WAITING}
+     * keep their status; any in-memory queue entries move to the successor so {@link #tryDispatch}
+     * can continue them (tryDispatch alone never reloads PENDING rows from the store).
+     */
+    public TaskHandoverResult transferOwnership(String fromUserId, String toUserId) {
+        if (fromUserId == null || toUserId == null || fromUserId.equals(toUserId)) {
+            return new TaskHandoverResult(0, 0);
+        }
+        List<Task> mine = owned(fromUserId).toList();
+        java.util.Set<String> ids = mine.stream().map(Task::id).collect(java.util.stream.Collectors.toSet());
+        List<QueuedRun> moved = new ArrayList<>();
+        synchronized (schedulerLock) {
+            Deque<QueuedRun> q = queues.get(fromUserId);
+            if (q != null) {
+                for (java.util.Iterator<QueuedRun> it = q.iterator(); it.hasNext(); ) {
+                    QueuedRun run = it.next();
+                    if (ids.contains(run.taskId())) {
+                        moved.add(run);
+                        it.remove();
+                    }
+                }
+            }
+        }
+        int stopped = 0;
+        int reassigned = 0;
+        for (Task task : mine) {
+            Task current = task;
+            // Issue #22: only RUNNING / NEEDS_CONFIRMATION are stop-then-reassign.
+            // PENDING / WAITING keep their status and only change createdBy.
+            if (current.status() == TaskStatus.RUNNING || current.status() == TaskStatus.NEEDS_CONFIRMATION) {
+                try {
+                    stop(current.id(), fromUserId);
+                } catch (RuntimeException e) {
+                    log.warn("handover stop task {} failed: {}", current.id(), e.getMessage());
+                }
+                current = tasks.findTask(current.id()).orElse(current);
+                if (current.status() == TaskStatus.RUNNING || current.status() == TaskStatus.NEEDS_CONFIRMATION) {
+                    current = current.finished(TaskStatus.STOPPED, current.progress(), "因离职交接停止");
+                    tasks.save(current);
+                    publish(current, null);
+                }
+                stopped++;
+            }
+            current = tasks.findTask(current.id()).orElse(current);
+            if (current.status() != TaskStatus.DELETED && !toUserId.equals(current.createdBy())) {
+                tasks.save(current.withCreatedBy(toUserId));
+                reassigned++;
+            }
+        }
+        java.util.Set<String> movedIds = moved.stream().map(QueuedRun::taskId)
+                .collect(java.util.stream.Collectors.toSet());
+        synchronized (schedulerLock) {
+            Deque<QueuedRun> dest = queues.computeIfAbsent(toUserId, k -> new ArrayDeque<>());
+            java.util.Set<String> already = dest.stream().map(QueuedRun::taskId)
+                    .collect(java.util.stream.Collectors.toCollection(java.util.HashSet::new));
+            for (QueuedRun run : moved) {
+                Task t = tasks.findTask(run.taskId()).orElse(null);
+                if (t == null || t.status() != TaskStatus.PENDING || !already.add(run.taskId())) {
+                    continue;
+                }
+                dest.addLast(run);
+            }
+            // Admitted but not in any queue (e.g. race) would never start again — drop the mark
+            // so the scheduler / admit path can pick never-started PENDING work back up.
+            for (String id : ids) {
+                if (movedIds.contains(id)) {
+                    continue;
+                }
+                Task t = tasks.findTask(id).orElse(null);
+                if (t != null && t.status() == TaskStatus.PENDING && t.workspaceDir() == null) {
+                    admitted.remove(id);
+                }
+            }
+        }
+        tryDispatch(toUserId);
+        Runnable wake = wakeScheduler;
+        if (wake != null) {
+            wake.run();
+        }
+        log.info("handover tasks from {} to {}: stopped={}, reassigned={}, requeued={}",
+                fromUserId, toUserId, stopped, reassigned, movedIds.size());
+        return new TaskHandoverResult(stopped, reassigned);
+    }
+
+    public record TaskHandoverResult(int stopped, int reassigned) {
     }
 
     @PreDestroy

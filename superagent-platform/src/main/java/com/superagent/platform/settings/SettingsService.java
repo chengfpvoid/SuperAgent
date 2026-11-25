@@ -20,12 +20,24 @@ public class SettingsService {
     static final String COMPLEX_MAX_PARALLEL = "task.complex.max-parallel";
     static final String TASK_FIXED_ON = "task.fixed-models.on";
     static final String TASK_FIXED_MODELS = "task.fixed-models";
-    /** Matches {@code CodeBuddyCliAgentRunner.INTERNET_ENV_SETTING}. */
+    static final String CODE_ROOTS = "task.coding.local-roots";
+    static final String REVIEW_MAX_ROUNDS = "task.coding.review-max-rounds";
+    static final String REVIEW_MAX_SPEND = "task.coding.review-max-spend";
+    static final String CHAT_MAX_TOKENS = "chat.session.max-tokens";
+    static final String CHAT_MAX_TURNS = "chat.session.max-turns";
+    static final String DOC_STYLE_ON = "doc-style.on", DOC_STYLE_SKILL = "doc-style.skill";
+    static final String SUBTITLE_CALIBRATORS = "task.subtitle.max-calibrators";
+    /** The same key the CodeBuddy runner and probe read. */
     static final String CODEBUDDY_INTERNET_ENV = "codebuddy.internet-environment";
-    public static final int DEFAULT_MAX_SUBTASKS = 10;
-    public static final int DEFAULT_MAX_PARALLEL = 5;
     private static final java.util.Set<String> CODEBUDDY_INTERNET_ENVS =
             java.util.Set.of("internal", "public", "ioa", "cloudhosted", "selfhosted");
+    public static final int DEFAULT_REVIEW_MAX_ROUNDS = 8;
+    public static final double DEFAULT_REVIEW_MAX_SPEND = 30;
+    public static final int DEFAULT_MAX_SUBTASKS = 10;
+    public static final int DEFAULT_MAX_PARALLEL = 5;
+    public static final int DEFAULT_SUBTITLE_CALIBRATORS = 3;
+    public static final int DEFAULT_CHAT_MAX_TOKENS = 300_000;
+    public static final int DEFAULT_CHAT_MAX_TURNS = 40;
 
     private final SystemSettingStore store;
     private final ProviderService providerService;
@@ -57,8 +69,22 @@ public class SettingsService {
         return new SystemSettingsDto(trimToNull(all.get(AGENT_DEFAULT_MODEL)), companyName(all),
                 trimToNull(all.get(COMPANY_SHORT_NAME)), trimToNull(all.get(PUBLIC_URL)), list(all, BACKUP_MODELS),
                 number(all, COMPLEX_MAX_SUBTASKS, DEFAULT_MAX_SUBTASKS), number(all, COMPLEX_MAX_PARALLEL, DEFAULT_MAX_PARALLEL),
-                "true".equals(all.get(TASK_FIXED_ON)), list(all, TASK_FIXED_MODELS),
-                codebuddyInternetEnvironment(all));
+                "true".equals(all.get(TASK_FIXED_ON)), list(all, TASK_FIXED_MODELS), lines(all, CODE_ROOTS),
+                number(all, REVIEW_MAX_ROUNDS, DEFAULT_REVIEW_MAX_ROUNDS), decimal(all, REVIEW_MAX_SPEND, DEFAULT_REVIEW_MAX_SPEND),
+                number(all, SUBTITLE_CALIBRATORS, DEFAULT_SUBTITLE_CALIBRATORS),
+                trimToNull(all.get(CODEBUDDY_INTERNET_ENV)) == null ? "internal" : all.get(CODEBUDDY_INTERNET_ENV).strip(),
+                number(all, CHAT_MAX_TOKENS, DEFAULT_CHAT_MAX_TOKENS), number(all, CHAT_MAX_TURNS, DEFAULT_CHAT_MAX_TURNS),
+                !"false".equals(all.get(DOC_STYLE_ON)), trimToNull(all.get(DOC_STYLE_SKILL)));
+    }
+
+    /** One of CodeBuddy's regions, lower-cased; anything else is refused. */
+    private static String requireCodebuddyInternetEnvironment(String value) {
+        String v = value.strip().toLowerCase(java.util.Locale.ROOT);
+        if (!CODEBUDDY_INTERNET_ENVS.contains(v)) {
+            throw new IllegalArgumentException("CodeBuddy 区域只能是 " + String.join(" / ",
+                    new java.util.TreeSet<>(CODEBUDDY_INTERNET_ENVS)) + "，收到：" + value);
+        }
+        return v;
     }
 
     /**
@@ -79,22 +105,64 @@ public class SettingsService {
         if (fixedOn && fixed.isEmpty()) {
             throw new IllegalArgumentException("开启任务固定模型时，至少要选一个模型");
         }
+        java.util.List<String> backups = request.backupModels() == null ? null : models(request.backupModels(), backupModels());
+        String url = request.publicUrl() == null ? null : publicUrl(request.publicUrl());
+        String roots = request.codeRoots() == null ? null : codeRoots(request.codeRoots());
+        Integer subtasks = request.complexMaxSubtasks() == null ? null : bounded(request.complexMaxSubtasks(), 1, 50, "子任务上限");
+        Integer parallel = request.complexMaxParallel() == null ? null
+                : bounded(request.complexMaxParallel(), 1, 20, "同时运行的子任务数");
+        Integer rounds = request.codingReviewMaxRounds() == null ? null
+                : bounded(request.codingReviewMaxRounds(), 1, 20, "编码任务审查的最多轮数");
+        Double spend = request.codingReviewMaxSpend() == null ? null : spend(request.codingReviewMaxSpend());
+        Integer calibrators = request.subtitleMaxCalibrators() == null ? null
+                : bounded(request.subtitleMaxCalibrators(), 1, 10, "字幕校准模型数上限");
+        Integer chatTokens = request.chatSessionMaxTokens() == null ? null
+                : bounded(request.chatSessionMaxTokens(), 20_000, 5_000_000, "会话切换的 token 阈值");
+        Integer chatTurns = request.chatSessionMaxTurns() == null ? null
+                : bounded(request.chatSessionMaxTurns(), 5, 1000, "会话切换的轮数阈值");
+        String companyName = name(request.companyName(), 100);
+        String shortName = name(request.companyShortName(), 20);
+
         store.put(AGENT_DEFAULT_MODEL, model);
-        store.put(COMPANY_NAME, name(request.companyName(), 100));
-        store.put(COMPANY_SHORT_NAME, name(request.companyShortName(), 20));
-        if (request.backupModels() != null) {
-            store.put(BACKUP_MODELS, join(models(request.backupModels(), backupModels())));
+        store.put(COMPANY_NAME, companyName);
+        store.put(COMPANY_SHORT_NAME, shortName);
+        if (backups != null) {
+            store.put(BACKUP_MODELS, join(backups));
         }
         store.put(TASK_FIXED_MODELS, join(fixed));
         store.put(TASK_FIXED_ON, fixedOn ? "true" : null);
         if (request.publicUrl() != null) {
-            store.put(PUBLIC_URL, publicUrl(request.publicUrl()));
+            store.put(PUBLIC_URL, url);
         }
-        if (request.complexMaxSubtasks() != null) {
-            store.put(COMPLEX_MAX_SUBTASKS, String.valueOf(bounded(request.complexMaxSubtasks(), 1, 50, "子任务上限")));
+        if (request.codeRoots() != null) {
+            store.put(CODE_ROOTS, roots);
         }
-        if (request.complexMaxParallel() != null) {
-            store.put(COMPLEX_MAX_PARALLEL, String.valueOf(bounded(request.complexMaxParallel(), 1, 20, "同时运行的子任务数")));
+        if (subtasks != null) {
+            store.put(COMPLEX_MAX_SUBTASKS, String.valueOf(subtasks));
+        }
+        if (parallel != null) {
+            store.put(COMPLEX_MAX_PARALLEL, String.valueOf(parallel));
+        }
+        if (rounds != null) {
+            store.put(REVIEW_MAX_ROUNDS, String.valueOf(rounds));
+        }
+        if (spend != null) {
+            store.put(REVIEW_MAX_SPEND, String.valueOf(spend));
+        }
+        if (calibrators != null) {
+            store.put(SUBTITLE_CALIBRATORS, String.valueOf(calibrators));
+        }
+        if (chatTokens != null) {
+            store.put(CHAT_MAX_TOKENS, String.valueOf(chatTokens));
+        }
+        if (chatTurns != null) {
+            store.put(CHAT_MAX_TURNS, String.valueOf(chatTurns));
+        }
+        if (request.docStyleOn() != null) {
+            store.put(DOC_STYLE_ON, String.valueOf(request.docStyleOn()));
+        }
+        if (request.docStyleSkill() != null) {
+            store.put(DOC_STYLE_SKILL, request.docStyleSkill().strip());
         }
         if (request.codebuddyInternetEnvironment() != null) {
             store.put(CODEBUDDY_INTERNET_ENV, requireCodebuddyInternetEnvironment(request.codebuddyInternetEnvironment()));
@@ -125,28 +193,6 @@ public class SettingsService {
         return ids.isEmpty() ? null : String.join(",", ids);
     }
 
-    /** CodeBuddy region for this company; unset → China ({@code internal}). */
-    public String codebuddyInternetEnvironment() {
-        return codebuddyInternetEnvironment(store.all());
-    }
-
-    private static String codebuddyInternetEnvironment(Map<String, String> all) {
-        String v = trimToNull(all.get(CODEBUDDY_INTERNET_ENV));
-        if (v == null) {
-            return "internal";
-        }
-        String lower = v.toLowerCase(java.util.Locale.ROOT);
-        return CODEBUDDY_INTERNET_ENVS.contains(lower) ? lower : "internal";
-    }
-
-    private static String requireCodebuddyInternetEnvironment(String value) {
-        String v = value.strip().toLowerCase(java.util.Locale.ROOT);
-        if (!CODEBUDDY_INTERNET_ENVS.contains(v)) {
-            throw new IllegalArgumentException("CodeBuddy 网络环境只能是 internal / public / ioa / cloudhosted / selfhosted");
-        }
-        return v;
-    }
-
     /** The most subtasks a complex task may hand out. */
     public int complexMaxSubtasks() {
         return number(store.all(), COMPLEX_MAX_SUBTASKS, DEFAULT_MAX_SUBTASKS);
@@ -155,6 +201,47 @@ public class SettingsService {
     /** How many of a complex task's subtasks run at once. */
     public int complexMaxParallel() {
         return number(store.all(), COMPLEX_MAX_PARALLEL, DEFAULT_MAX_PARALLEL);
+    }
+
+    /** A coding task's review loop stops for the user after this many rounds. */
+    public int codingReviewMaxRounds() {
+        return number(store.all(), REVIEW_MAX_ROUNDS, DEFAULT_REVIEW_MAX_ROUNDS);
+    }
+
+    /** …or once the task has spent this much (USD). */
+    public double codingReviewMaxSpend() {
+        return decimal(store.all(), REVIEW_MAX_SPEND, DEFAULT_REVIEW_MAX_SPEND);
+    }
+
+    /** A chat session moves to a new one once its last turn read this many tokens. */
+    public int chatSessionMaxTokens() {
+        return number(store.all(), CHAT_MAX_TOKENS, DEFAULT_CHAT_MAX_TOKENS);
+    }
+
+    /** …or once it has had this many turns. */
+    public int chatSessionMaxTurns() {
+        return number(store.all(), CHAT_MAX_TURNS, DEFAULT_CHAT_MAX_TURNS);
+    }
+
+    /** A subtitle task's disputed spans go to at most this many text models. */
+    public int subtitleMaxCalibrators() {
+        return number(store.all(), SUBTITLE_CALIBRATORS, DEFAULT_SUBTITLE_CALIBRATORS);
+    }
+
+    private static double decimal(Map<String, String> all, String key, double fallback) {
+        try {
+            String v = trimToNull(all.get(key));
+            return v == null ? fallback : Double.parseDouble(v);
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    private static double spend(double value) {
+        if (!(value >= 1 && value <= 1000)) {
+            throw new IllegalArgumentException("编码任务的费用上限要在 1 到 1000 美元之间");
+        }
+        return value;
     }
 
     private static int number(Map<String, String> all, String key, int fallback) {
@@ -200,6 +287,45 @@ public class SettingsService {
         String v = trimToNull(all.get(key));
         return v == null ? java.util.List.of() : java.util.Arrays.stream(v.split(",")).map(String::strip)
                 .filter(x -> !x.isEmpty()).toList();
+    }
+
+    /** Directories a coding task may use a local repository under; empty = local projects are off. */
+    public java.util.List<String> codeRoots() {
+        return lines(store.all(), CODE_ROOTS);
+    }
+
+    // One per line: a path may hold a comma.
+    private static java.util.List<String> lines(Map<String, String> all, String key) {
+        String v = trimToNull(all.get(key));
+        return v == null ? java.util.List.of() : v.lines().map(String::strip).filter(x -> !x.isEmpty()).toList();
+    }
+
+    /** Each an existing directory, saved as its real path (no links, no ..), so a check against it can't be walked around. */
+    private static String codeRoots(java.util.List<String> requested) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        for (String r : requested) {
+            String v = trimToNull(r);
+            if (v == null) {
+                continue;
+            }
+            java.nio.file.Path p = java.nio.file.Path.of(v);
+            if (!p.isAbsolute()) {
+                throw new IllegalArgumentException("代码目录要写完整路径：" + v);
+            }
+            String real;
+            try {
+                real = p.toRealPath().toString();
+            } catch (java.io.IOException e) {
+                throw new IllegalArgumentException("这台服务器上没有目录 " + v);
+            }
+            if (!java.nio.file.Files.isDirectory(p) || real.equals(p.getRoot().toString())) {
+                throw new IllegalArgumentException("代码目录要是一个具体的目录（不能是根目录）：" + v);
+            }
+            if (!out.contains(real)) {
+                out.add(real);
+            }
+        }
+        return out.isEmpty() ? null : String.join("\n", out);
     }
 
     /** How people reach this server from outside, set by the admin; null when it should follow the request. */

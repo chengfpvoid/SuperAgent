@@ -55,6 +55,7 @@ abstract class JsonLineCliRunner implements AgentRunner {
 
     private final String command;
     private final long timeoutSeconds;
+    private final Object[] sessionLocks = java.util.stream.IntStream.range(0, 256).mapToObj(i -> new Object()).toArray();
     private CliPaths cliPaths; // null in tests: the command runs from the process PATH as given
 
     protected JsonLineCliRunner(String command, long timeoutSeconds) {
@@ -69,6 +70,11 @@ abstract class JsonLineCliRunner implements AgentRunner {
 
     protected final String command() {
         return command;
+    }
+
+    /** Serializes runs that share a CLI home while allowing unrelated sessions to run concurrently. */
+    protected final Object sessionLock(AgentRunRequest request) {
+        return sessionLocks[Math.floorMod(java.util.Objects.hash(request.workspaceDir(), request.sessionId()), sessionLocks.length)];
     }
 
     /** The argv; temp files it creates go in {@code cleanup}, removed when the run ends. */
@@ -134,7 +140,7 @@ abstract class JsonLineCliRunner implements AgentRunner {
                 cliPaths.apply(pb);
             }
             pb.environment().putAll(environment(request));
-            process = pb.start();
+            process = CliProcesses.track(pb.start());
             try (OutputStream in = process.getOutputStream()) {
                 String stdin = stdin(request, resumeId);
                 if (stdin != null) {
@@ -146,7 +152,7 @@ abstract class JsonLineCliRunner implements AgentRunner {
             emit(sink, request, seq, AgentEventType.ERROR, "Failed to start " + command + ": " + e.getMessage());
             return;
         }
-        cancellation.onCancel(process::destroyForcibly);
+        cancellation.onCancel(() -> CliProcesses.kill(process)); // with its children: a tool it started must not live on
         StringBuilder stderr = new StringBuilder();
         Thread drain = new Thread(() -> drain(process.getErrorStream(), stderr), command + "-stderr-" + request.sessionId());
         drain.setDaemon(true);

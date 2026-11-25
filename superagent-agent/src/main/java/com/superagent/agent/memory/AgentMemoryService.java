@@ -142,6 +142,11 @@ public class AgentMemoryService {
      * them. Messages in {@code exclude} (the one being sent now) are left out. Null when there is nothing at all.
      */
     public String context(Agent agent, Collection<String> exclude, String user) {
+        return context(agent, exclude, user, null);
+    }
+
+    /** As above, with {@code handoff} (a summary of the session just left) ahead of the recent messages. */
+    public String context(Agent agent, Collection<String> exclude, String user, String handoff) {
         String memory = read(agent);
         List<ChatMessage> all = messages(agent.id()).stream()
                 .filter(m -> exclude == null || !exclude.contains(m.id())).toList();
@@ -150,6 +155,9 @@ public class AgentMemoryService {
         java.util.List<String> parts = new java.util.ArrayList<>();
         if (memory != null && !memory.isBlank()) {
             parts.add(memory.strip());
+        }
+        if (handoff != null && !handoff.isBlank()) {
+            parts.add("## 上一个会话的交接摘要（会话太长，已换到新会话；以此接着做）\n" + handoff.strip());
         }
         if (!transcript.isBlank()) {
             parts.add("## 最近的对话（原文，从较早到最新；更早的对话用 chat_history_search / chat_history_read 查）\n" + transcript);
@@ -262,8 +270,56 @@ public class AgentMemoryService {
         if (text != null && text.length() > AgentMemoryRules.MAX_CHARS) {
             throw new IllegalArgumentException("记忆不能超过 " + AgentMemoryRules.MAX_CHARS + " 字");
         }
-        states.save(state(agent).withMemory(text));
+        synchronized (lock(agent.id())) {
+            states.save(state(agent).editedByPerson(text));
+        }
         runLog.info(agent, AgentLogService.MEMORY, text == null ? by + " 清空了记忆" : by + " 编辑了记忆", null);
+    }
+
+    /**
+     * The agent writes its own memory: {@code content} added to {@code category} or ({@code replace}) in place of it.
+     * The category is then the agent's: distilling only adds to it. Records who the run was for and where it was.
+     * A memory from before categories is sorted into them on the way. Returns the category as stored.
+     */
+    public String writeSection(Agent agent, String category, String content, boolean replace, String by, String sessionId,
+                               String taskId) {
+        if (category == null || category.isBlank()) {
+            throw new IllegalArgumentException("请填写类别，例如：" + String.join("、", MemorySections.SUGGESTED));
+        }
+        String cat = MemorySections.category(category);
+        if (cat.length() > 30) {
+            throw new IllegalArgumentException("类别名最多 30 个字");
+        }
+        if (!replace && (content == null || content.isBlank())) {
+            throw new IllegalArgumentException("请填写要记下的内容");
+        }
+        synchronized (lock(agent.id())) {
+            AgentMemoryState s = state(agent);
+            String next = MemorySections.render(agent.name(), MemorySections.write(s.memory(), cat, content, replace));
+            if (next != null && next.length() > AgentMemoryRules.MAX_CHARS) {
+                throw new IllegalArgumentException("记忆会超过 " + AgentMemoryRules.MAX_CHARS + " 字，请先用 replace 精简这个类别");
+            }
+            states.save(s.writtenByAgent(next, MemorySections.withOwned(s.agentSections(), cat), by, sessionId, taskId));
+        }
+        runLog.info(agent, AgentLogService.MEMORY, agent.name() + (replace ? " 改写了记忆「" : " 往记忆「") + cat
+                + (replace ? "」" : "」里记了一条") + "（代表 " + by + "）", content);
+        return cat;
+    }
+
+    /** When and for whom the agent last wrote its memory itself, and in which conversation or task; null if never. */
+    public AgentMemoryState lastAgentWrite(Agent agent) {
+        return states.find(agent.id()).filter(s -> s.writtenAt() != null).orElse(null);
+    }
+
+    /** Categories the agent wrote itself (distilling only adds to them), in the order it first wrote them. */
+    public List<String> agentSections(Agent agent) {
+        return states.find(agent.id()).map(s -> MemorySections.owned(s.agentSections())).orElse(List.of());
+    }
+
+    private final Map<String, Object> locks = new ConcurrentHashMap<>();
+
+    private Object lock(String agentId) {
+        return locks.computeIfAbsent(agentId, k -> new Object());
     }
 
     /** Distils now whatever isn't in memory yet; false when there's nothing new or a run is already going. */
@@ -299,6 +355,18 @@ public class AgentMemoryService {
     // --- forgetting ---
 
     /** Deletes the agent's memory and its bookkeeping (when the agent itself is deleted). */
+    /** Employee handover: keep the memory document, rewrite its owner field with the agent. */
+    public void transferOwner(Agent agent, String newOwner) {
+        if (agent == null || newOwner == null) {
+            return;
+        }
+        states.find(agent.id()).ifPresent(s -> {
+            if (!newOwner.equals(s.owner())) {
+                states.save(s.withOwner(newOwner));
+            }
+        });
+    }
+
     public void forget(Agent agent) {
         states.delete(agent.id());
         backoff.remove(agent.id());
@@ -356,12 +424,15 @@ public class AgentMemoryService {
         return messages(agent.id()).stream().filter(m -> cursor == null || m.createdAt().isAfter(cursor)).toList();
     }
 
-    private void consolidate(Agent agent, List<ChatMessage> fresh) {
+    void consolidate(Agent agent, List<ChatMessage> fresh) {
         Instant until = fresh.get(fresh.size() - 1).createdAt();
         String current = read(agent);
+        // A memory from before categories goes to the model already sorted, so nothing of it hinges on the model.
+        String sorted = current == null ? null : MemorySections.render(agent.name(), MemorySections.parse(current));
+        List<String> owned = MemorySections.owned(state(agent).agentSections());
         String answer;
         try {
-            answer = summarize(agent, AgentMemoryRules.prompt(agent.name(), current,
+            answer = summarize(agent, AgentMemoryRules.prompt(agent.name(), sorted, owned,
                     AgentMemoryRules.transcript(fresh, zone)));
         } catch (RuntimeException e) {
             log.warn("memory run for agent {} failed, retrying later: {}", agent.id(), e.getMessage());
@@ -385,9 +456,10 @@ public class AgentMemoryService {
             }
             case UPDATED -> {
                 write(agent, outcome.memory());
+                String merged = read(agent);
                 log.info("memory of agent {} updated from {} message(s)", agent.id(), fresh.size());
                 runLog.info(agent, AgentLogService.MEMORY, "记忆已更新（" + (current == null ? 0 : current.length())
-                        + " → " + outcome.memory().length() + " 字，来自 " + fresh.size() + " 条消息）", null);
+                        + " → " + (merged == null ? 0 : merged.length()) + " 字，来自 " + fresh.size() + " 条消息）", null);
             }
         }
         states.save(state(agent).summarizedTo(until));
@@ -409,8 +481,52 @@ public class AgentMemoryService {
     }
 
 
+    /** Handoff summaries are only worth waiting for so long: the turn that triggers one is held up by it. */
+    public static final Duration HANDOFF_TIMEOUT = Duration.ofSeconds(90);
+
     /** One run of the cheapest model that can run (else the default), no tools, in a scratch directory; returns its final text. */
-    private String summarize(Agent agent, String prompt) {
+    String summarize(Agent agent, String prompt) {
+        return runCheap(agent, prompt, com.superagent.core.usage.UsageContext.SOURCE_MEMORY, new Cancellation());
+    }
+
+    /**
+     * A handoff summary of an old session for the next one, within {@code timeout}; null when it can't be made
+     * (the new session then starts from memory and recent messages alone). The reason is returned in {@code why}.
+     */
+    public String handoff(Agent agent, List<ChatMessage> session, Duration timeout, java.util.function.Consumer<String> why) {
+        String transcript = AgentMemoryRules.carryOver(session, zone, recentMessages);
+        if (transcript.isBlank()) {
+            why.accept("旧会话没有内容");
+            return null;
+        }
+        Cancellation cancel = new Cancellation();
+        java.util.concurrent.FutureTask<String> run = new java.util.concurrent.FutureTask<>(() ->
+                runCheap(agent, AgentMemoryRules.handoffPrompt(agent.name(), transcript),
+                        com.superagent.core.usage.UsageContext.SOURCE_SESSION_HANDOFF, cancel));
+        Thread worker = new Thread(TenantContext.wrap(run), "session-handoff");
+        worker.setDaemon(true);
+        worker.start();
+        try {
+            String out = run.get(timeout.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
+            if (out == null || out.isBlank()) {
+                why.accept("模型没有返回摘要");
+                return null;
+            }
+            return out.strip();
+        } catch (java.util.concurrent.TimeoutException e) {
+            cancel.cancel();
+            why.accept("生成超时（" + timeout.toSeconds() + " 秒）");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            cancel.cancel();
+            why.accept("被中断");
+        } catch (java.util.concurrent.ExecutionException e) {
+            why.accept(String.valueOf(e.getCause() == null ? e.getMessage() : e.getCause().getMessage()));
+        }
+        return null;
+    }
+
+    private String runCheap(Agent agent, String prompt, String source, Cancellation cancellation) {
         String model = (modelRouter == null ? java.util.Optional.<com.superagent.core.provider.ModelRouter.ModelChoice>empty()
                 : modelRouter.cheapest()).map(com.superagent.core.provider.ModelRouter.ModelChoice::model)
                 .orElseGet(settings::agentDefaultModel);
@@ -443,8 +559,8 @@ public class AgentMemoryService {
                     credentials == null ? null : credentials.current(type.cliName()).credential()),
                     // Keeping an agent's memory is part of using it: on its owner.
                     com.superagent.core.usage.UsageRecorder.tap(usage, new com.superagent.core.usage.UsageContext(agent.owner(),
-                            com.superagent.core.usage.UsageContext.SOURCE_MEMORY, agent.id(), null, null, type.cliName()), sink),
-                    new Cancellation());
+                            source, agent.id(), null, null, type.cliName()), sink),
+                    cancellation);
         } finally {
             deleteQuietly(scratch);
         }
@@ -455,8 +571,16 @@ public class AgentMemoryService {
         return out;
     }
 
-    private void write(Agent agent, String memory) {
-        states.save(state(agent).withMemory(memory));
+    /**
+     * Folds a distilled document into the memory as it is now (the agent may have written while the model ran): its
+     * own categories keep their text, a category the model left out stays.
+     */
+    private void write(Agent agent, String distilled) {
+        synchronized (lock(agent.id())) {
+            AgentMemoryState s = state(agent);
+            states.save(s.withMemory(MemorySections.render(agent.name(),
+                    MemorySections.merge(s.memory(), distilled, MemorySections.owned(s.agentSections())))));
+        }
     }
 
     /** Every message of every session the agent has had, oldest first. */

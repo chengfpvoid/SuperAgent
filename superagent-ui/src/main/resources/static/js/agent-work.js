@@ -137,7 +137,24 @@ function agentWorkRow(t) {
   btn.append(dot, body);
   btn.addEventListener("click", () => { setView("tasks"); openTask(t.id); });
   li.appendChild(btn);
+  if (isActiveStatus(t.status)) li.appendChild(agentWorkStop(t));
   return li;
+}
+
+// Beside the row, not inside it: clicking Stop must not open the task.
+function agentWorkStop(t) {
+  const stop = document.createElement("button");
+  stop.type = "button";
+  stop.className = "sw-stop";
+  stop.textContent = L("aw.stop");
+  stop.addEventListener("click", async e => {
+    e.stopPropagation();
+    if (!window.confirm(L("aw.stopConfirm", { title: t.title }))) return;
+    stop.disabled = true;
+    try { await api.stopTask(t.id).then(kbJson); } catch (err) { showToast(err.message, true); }
+    if (activeAgent) renderAgentWork(activeAgent);
+  });
+  return stop;
 }
 
 function closeAgentDetail() { awel.drawer.hidden = true; }
@@ -203,6 +220,62 @@ function markTaskReport(msgEl, taskId) {
   tag.title = L("super.dispatchOpenTask");
   tag.addEventListener("click", () => { setView("tasks"); openTask(taskId); });
   msgEl.prepend(tag);
+  foldLongLists(msgEl.querySelector(".bubble"));
+  attachTaskReplies(msgEl, taskId);
+}
+
+/** A long list in a notice (the files a task changed, say) shows its first few items; the rest open on a click. */
+function foldLongLists(bubble, keep = 4) {
+  if (!bubble) return;
+  bubble.querySelectorAll("ul, ol").forEach(list => {
+    const items = [...list.children].filter(li => li.tagName === "LI");
+    if (items.length <= keep + 2) return;
+    const rest = items.slice(keep);
+    rest.forEach(li => { li.hidden = true; });
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "list-fold";
+    const label = () => rest[0].hidden ? L("chat.listMore", { n: rest.length }) : L("chat.listLess");
+    btn.textContent = label();
+    btn.addEventListener("click", e => {
+      e.stopPropagation();
+      const show = rest[0].hidden;
+      rest.forEach(li => { li.hidden = !show; });
+      btn.textContent = label();
+    });
+    list.after(btn);
+  });
+}
+
+/**
+ * A task waiting on the user (a coding task's spec, say) offers its answers as buttons that go straight to the task,
+ * not to the chat. Only on that task's latest note; shown while it still waits (see .task-replies in app.css).
+ */
+function attachTaskReplies(msgEl, taskId) {
+  const bubble = msgEl.querySelector(".bubble");
+  const replies = nextReplies(bubble && (bubble.dataset.md || bubble.textContent));
+  if (!replies.length) return;
+  el.messages.querySelectorAll('.msg--task-report[data-task-id="' + CSS.escape(taskId) + '"] .task-replies')
+    .forEach(x => x.remove());
+  const row = document.createElement("div");
+  row.className = "quick-replies task-replies";
+  const sent = document.createElement("span");
+  sent.className = "task-replies__sent";
+  replies.forEach(reply => row.appendChild(quickReplyButton(reply, async () => {
+    row.querySelectorAll("button").forEach(b => { b.disabled = true; });
+    try {
+      await kbJson(await api.taskMessage(taskId, reply));
+      row.replaceChildren(sent);
+      sent.textContent = L("chat.taskReplySent", { reply });
+      agentTaskStatus.byId.set(taskId, "running");
+      msgEl.className = msgEl.className.replace(/\bis-\S*/g, "").trim() + " is-running";
+    } catch (e) {
+      row.querySelectorAll("button").forEach(b => { b.disabled = false; });
+      sent.textContent = L("chat.taskReplyFailed") + (e.message ? "（" + e.message + "）" : "");
+      row.appendChild(sent);
+    }
+  })));
+  msgEl.appendChild(row);
 }
 
 // Tasks move on their own: keep the list current while the agent's chat is open — every 5 s while one is under

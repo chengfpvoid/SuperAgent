@@ -1,6 +1,9 @@
 spring:
   application:
     name: superagent-server
+  lifecycle:
+    # Each shutdown phase may take this long: task turns get superagent.task.shutdown.timeout (2 min) to finish.
+    timeout-per-shutdown-phase: 3m
   autoconfigure:
     exclude: org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
   servlet:
@@ -33,6 +36,10 @@ logging:
     com.superagent: DEBUG
 
 superagent:
+  provider:
+    codex:
+      # Allow companies without a Codex key to use the server user's CLI login (shared across those companies).
+      use-cli-login: true
   registration:
     # Whether the sign-in page lets anyone register an organization. Turn it off once the organizations you want exist.
     enabled: ${SUPERAGENT_REGISTRATION_ENABLED:true}
@@ -53,6 +60,28 @@ superagent:
       password: ${SUPERAGENT_STORAGE_MYSQL_PASSWORD:Hollis666}
   agent:
     workspace-dir: ./data/workspaces
+    # How long one agent turn may run before it is stopped. A coding task's development step can take a long time;
+    # a stuck turn is still stopped, just later. One value for every CLI.
+    claude:
+      timeout-seconds: ${SUPERAGENT_AGENT_TIMEOUT_SECONDS:3600}
+    codebuddy:
+      timeout-seconds: ${SUPERAGENT_AGENT_TIMEOUT_SECONDS:3600}
+    codex:
+      timeout-seconds: ${SUPERAGENT_AGENT_TIMEOUT_SECONDS:3600}
+    deepseek:
+      timeout-seconds: ${SUPERAGENT_AGENT_TIMEOUT_SECONDS:3600}
+    gemini:
+      timeout-seconds: ${SUPERAGENT_AGENT_TIMEOUT_SECONDS:3600}
+    grok:
+      timeout-seconds: ${SUPERAGENT_AGENT_TIMEOUT_SECONDS:3600}
+    kimi:
+      timeout-seconds: ${SUPERAGENT_AGENT_TIMEOUT_SECONDS:3600}
+    minimax:
+      timeout-seconds: ${SUPERAGENT_AGENT_TIMEOUT_SECONDS:3600}
+    qoder:
+      timeout-seconds: ${SUPERAGENT_AGENT_TIMEOUT_SECONDS:3600}
+    qwen:
+      timeout-seconds: ${SUPERAGENT_AGENT_TIMEOUT_SECONDS:3600}
   attachments:
     dir: ./data/attachments
   files:
@@ -61,5 +90,9 @@ superagent:
     allowed-tools: ${SUPERAGENT_TASK_ALLOWED_TOOLS:Read,Glob,Grep,LS,Edit,Write,Bash}
     skip-permissions: ${SUPERAGENT_TASK_SKIP_PERMISSIONS:false}
     max-parallel: ${SUPERAGENT_TASK_MAX_PARALLEL:50}
+    # On shutdown: how long running task turns (and local merges) get to finish before they're cut short and resumed
+    # after the next start. The stop script's STOP_TIMEOUT must stay above it.
+    shutdown:
+      timeout: ${SUPERAGENT_TASK_SHUTDOWN_TIMEOUT:120s}
   app:
     base-url: ${SUPERAGENT_BASE_URL:}

@@ -37,6 +37,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -170,12 +171,39 @@ public class AgentService {
     /** The user's agents (their SuperAgent first, created now if they have none yet), then agents shared with them. */
     public List<AgentDto> list(String owner) {
         ensureSuperAgent(owner);
-        List<AgentDto> out = new ArrayList<>(owned(owner).stream()
-                .sorted(Comparator.comparing((Agent a) -> !a.isSuper()))
-                .map(a -> toDto(a, chatService.currentSessionId(a.id()), owner))
-                .toList());
-        sharedWith(owner).forEach(a -> out.add(toDto(a, chatService.currentSessionId(a.id()), owner)));
+        Map<String, Integer> saved = order == null ? Map.of() : order.positions(owner);
+        List<Agent> mine = owned(owner);
+        List<AgentDto> out = new ArrayList<>();
+        mine.stream().filter(Agent::isSuper).forEach(a -> out.add(toDto(a, chatService.currentSessionId(a.id()), owner)));
+        sidebarOrder(mine.stream().filter(a -> !a.isSuper()).toList(), saved)
+                .forEach(a -> out.add(toDto(a, chatService.currentSessionId(a.id()), owner)));
+        sidebarOrder(sharedWith(owner), saved).forEach(a -> out.add(toDto(a, chatService.currentSessionId(a.id()), owner)));
         return out;
+    }
+
+    /** Never-dragged agents first, newest created on top; dragged ones after, by saved position. Editing an agent moves nothing. */
+    private static List<Agent> sidebarOrder(List<Agent> agents, Map<String, Integer> saved) {
+        return agents.stream().sorted(Comparator
+                .comparing((Agent a) -> saved.containsKey(a.id()))
+                .thenComparing(a -> saved.getOrDefault(a.id(), 0))
+                .thenComparing(Agent::createdAt, Comparator.nullsLast(Comparator.reverseOrder()))).toList();
+    }
+
+    /** Saves the order of one sidebar group for this user; only agents they can see count, the SuperAgent never does. */
+    public void reorder(String user, List<String> agentIds) {
+        if (order == null || agentIds == null) {
+            return;
+        }
+        List<String> visible = new ArrayList<>(owned(user).stream().map(Agent::id).toList());
+        sharedWith(user).forEach(a -> visible.add(a.id()));
+        java.util.Set<String> superIds = new java.util.HashSet<>();
+        owned(user).stream().filter(Agent::isSuper).forEach(a -> superIds.add(a.id()));
+        for (String id : agentIds) {
+            if (!visible.contains(id) || superIds.contains(id)) {
+                throw new AgentNotFoundException(id);
+            }
+        }
+        order.save(user, agentIds.stream().distinct().toList());
     }
 
     /** The user's live agents, in the store's order (most recently updated first). */
@@ -351,8 +379,17 @@ public class AgentService {
     /** Members may read the agent's memory; only its owner changes it. */
     public AgentMemoryDto memory(String id, String user) {
         Agent agent = requireViewer(id, user);
+        com.superagent.core.agent.AgentMemoryState w = memory.lastAgentWrite(agent);
+        AgentMemoryDto.AgentWrite write = w == null ? null : new AgentMemoryDto.AgentWrite(w.writtenBy(),
+                w.writtenBy() == null ? null : displayName(w.writtenBy()), w.writtenSession(), w.writtenTask(), w.writtenAt());
         return new AgentMemoryDto(memory.read(agent), memory.updatedAt(agent), Objects.equals(agent.owner(), user),
-                memory.distilling(agent.id()));
+                memory.distilling(agent.id()), memory.agentSections(agent), write);
+    }
+
+    /** The agent writes a category of its own memory in a run {@code user} set off (who must be able to see it). */
+    public String writeOwnMemory(Agent agent, String user, String category, String content, boolean replace,
+                                 String sessionId, String taskId) {
+        return memory.writeSection(agent, category, content, replace, user, sessionId, taskId);
     }
 
     public AgentMemoryDto editMemory(String id, String user, String text) {
@@ -375,9 +412,21 @@ public class AgentService {
     }
     private com.superagent.core.agent.AgentParentStore parents; // null in tests: no parent agents
 
+    private com.superagent.core.agent.AgentOrderStore order; // null in tests: creation order
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setOrder(com.superagent.core.agent.AgentOrderStore order) {
+        this.order = order;
+    }
+
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     void setParents(com.superagent.core.agent.AgentParentStore parents) {
         this.parents = parents;
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setRunLog(AgentLogService runLog) {
+        this.runLog = runLog;
     }
 
     // --- parent agents ---
@@ -512,5 +561,47 @@ public class AgentService {
         }
         return people.find(userId).map(u -> u.displayName() == null || u.displayName().isBlank()
                 ? u.username() : u.displayName()).orElse(userId);
+    }
+
+    /**
+     * Employee handover: move every live agent owned by {@code fromUserId} to {@code toUserId}.
+     * SuperAgents are demoted to STANDARD archive agents so the successor keeps their own SuperAgent.
+     * Returns how many agents moved (including demoted SuperAgents).
+     */
+    public int transferOwnership(String fromUserId, String toUserId) {
+        if (fromUserId == null || toUserId == null || fromUserId.equals(toUserId)) {
+            return 0;
+        }
+        String label = displayName(fromUserId);
+        String archiveName = (label == null || label.isBlank() ? fromUserId : label) + " · 工作档案";
+        Instant now = Instant.now();
+        int moved = 0;
+        for (Agent agent : owned(fromUserId)) {
+            Agent next = agent.isSuper()
+                    ? agent.demoteSuperToArchive(toUserId, archiveName)
+                    : agent.withOwner(toUserId);
+            store.update(next);
+            if (memory != null) {
+                memory.transferOwner(next, toUserId);
+            }
+            // Successor becoming owner: drop their collaborator row if present.
+            members.members(agent.id()).stream()
+                    .filter(m -> m.username().equals(toUserId) && m.active())
+                    .findFirst()
+                    .ifPresent(m -> members.save(new AgentMember(agent.id(), toUserId, m.addedBy(), false,
+                            m.createdAt(), now)));
+            moved++;
+            log.info("handover agent {} from {} to {} ({})", agent.id(), fromUserId, toUserId,
+                    agent.isSuper() ? "demoted SuperAgent" : "standard");
+        }
+        // Leaving person's memberships on others' agents: deactivate.
+        for (String agentId : members.agentsOf(fromUserId)) {
+            members.members(agentId).stream()
+                    .filter(m -> m.username().equals(fromUserId) && m.active())
+                    .findFirst()
+                    .ifPresent(m -> members.save(new AgentMember(agentId, fromUserId, m.addedBy(), false,
+                            m.createdAt(), now)));
+        }
+        return moved;
     }
 }

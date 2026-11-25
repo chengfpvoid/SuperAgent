@@ -52,3 +52,9 @@ FEATURE-BACKLOG.*.md
 superagent-server/data/*
 # Docker deployment secrets
 docker/.env
+
+# Local run copies (scripts/run-local.sh)
+/run/
+
+# scripts/package.sh: the last commit shipped to the deploy host
+scripts/.package-last-commit

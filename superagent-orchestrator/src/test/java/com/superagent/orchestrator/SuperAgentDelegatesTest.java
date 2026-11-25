@@ -59,7 +59,7 @@ class SuperAgentDelegatesTest {
         var round = new McpGrants.Grant("t", McpGrants.Kind.SUPER, "ada", null, "sa", null, null, null);
 
         // The reply that starts it ("m") comes along, for the task card under it.
-        org.mockito.Mockito.when(service.startTask("ada", null, "做 PPT", "按风格做", "m", "general")).thenReturn("t1");
+        org.mockito.Mockito.when(service.startTask("ada", null, "做 PPT", "按风格做", "m", "general", java.util.List.of())).thenReturn("t1");
         assertThat(tools.call(chat, "start_task", args).text()).contains("t1");
         org.assertj.core.api.Assertions.assertThatThrownBy(() -> tools.call(round, "start_task", args)).hasMessageContaining("聊天");
     }
@@ -71,7 +71,7 @@ class SuperAgentDelegatesTest {
         org.assertj.core.api.Assertions.assertThatThrownBy(() -> com.superagent.task.TaskKinds.require(json.readTree("{}")))
                 .isInstanceOf(com.superagent.runtime.mcp.McpToolException.class);
         org.assertj.core.api.Assertions.assertThatThrownBy(() -> com.superagent.task.TaskKinds.require(json.readTree("{\"kind\":\"writing\"}")))
-                .hasMessageContaining("coding、general 或 complex");
+                .hasMessageContaining("coding、general、complex、subtitle 或 article");
     }
 
     @Test

@@ -63,6 +63,7 @@ public class CodexCliAgentRunner implements AgentRunner {
     private final String command;
     private final long timeoutSeconds;
     private CliPaths cliPaths; // null in tests: the command runs from the process PATH as given
+    private Path codexHome = CodexRollouts.home();
 
     /** Run the CLI from the shared search path, so one the Models page installed (e.g. on a private Node) is found. */
     @Autowired(required = false)
@@ -75,6 +76,10 @@ public class CodexCliAgentRunner implements AgentRunner {
             @Value("${superagent.agent.codex.timeout-seconds:600}") long timeoutSeconds) {
         this.command = command;
         this.timeoutSeconds = timeoutSeconds;
+    }
+
+    void setCodexHome(Path codexHome) {
+        this.codexHome = codexHome;
     }
 
     @Override
@@ -90,6 +95,13 @@ public class CodexCliAgentRunner implements AgentRunner {
             // conversation to resume, so start one under the same SuperAgent session id.
             log.warn("session {} has no recorded codex thread; starting a new one", request.sessionId());
         }
+        // A resumed thread reports its running total: measure the run from the thread's total so far.
+        com.fasterxml.jackson.databind.JsonNode before = threadId == null ? null
+                : CodexRollouts.lastTotal(codexHome, threadId).orElse(null);
+        if (threadId != null && before == null) {
+            log.warn("session {}: no rollout total found for codex thread {}; this turn's tokens aren't billed",
+                    request.sessionId(), threadId);
+        }
         List<String> cmd = buildCommand(request, threadId);
         log.info("session {} running: {} (cwd={})", request.sessionId(), String.join(" ", cmd), request.workspaceDir());
 
@@ -102,6 +114,9 @@ public class CodexCliAgentRunner implements AgentRunner {
             if (request.credential() != null) {
                 // Codex's documented per-run key for exec mode; it never appears in argv.
                 pb.environment().put("CODEX_API_KEY", request.credential().apiKey());
+            } else {
+                pb.environment().remove("CODEX_API_KEY");
+                pb.environment().remove("OPENAI_API_KEY");
             }
             // MCP bearer tokens go through the environment, never argv (visible in ps / logs).
             for (McpServer server : mcpServers(request)) {
@@ -109,7 +124,7 @@ public class CodexCliAgentRunner implements AgentRunner {
                     pb.environment().put(server.tokenEnvVar(), server.token());
                 }
             }
-            process = pb.start();
+            process = CliProcesses.track(pb.start());
             try (OutputStream stdin = process.getOutputStream()) {
                 stdin.write(prompt(request, threadId == null).getBytes(StandardCharsets.UTF_8));
             }
@@ -117,7 +132,7 @@ public class CodexCliAgentRunner implements AgentRunner {
             emit(sink, request, 0, AgentEventType.ERROR, "Failed to start codex: " + e.getMessage());
             return;
         }
-        cancellation.onCancel(process::destroyForcibly);
+        cancellation.onCancel(() -> CliProcesses.kill(process)); // with its children: a tool it started must not live on
         StringBuilder stderr = new StringBuilder();
         Thread drain = new Thread(() -> drainStderr(process.getErrorStream(), stderr), "codex-stderr-" + request.sessionId());
         drain.setDaemon(true);
@@ -156,7 +171,13 @@ public class CodexCliAgentRunner implements AgentRunner {
             process.destroyForcibly();
             emit(sink, request, seq, AgentEventType.ERROR, "Codex run interrupted");
         } finally {
-            Tokens.emit(sink, request.sessionId(), seq + 1, parser.tokens(request.model()));
+            if (threadId == null || before != null) {
+                // The per-request figure the thread's rollout now ends with is this run's last, largest context.
+                String thread = parser.threadId() != null ? parser.threadId() : threadId;
+                long context = CodexRollouts.lastRequestInput(codexHome, thread).orElse(0L);
+                Tokens.emit(sink, request.sessionId(), seq + 1,
+                        Tokens.withContext(parser.tokens(request.model(), before), context));
+            }
         }
     }
 
@@ -192,6 +213,9 @@ public class CodexCliAgentRunner implements AgentRunner {
             // SuperAgent's own run config and are already scoped per turn — the same trust as Claude's allowlist.
             cmd.add("-c");
             cmd.add("mcp_servers." + server.name() + ".default_tools_approval_mode=\"approve\"");
+            // Some platform tools take minutes (transcribing an hour of audio): Codex gives up after 60 s by default.
+            cmd.add("-c");
+            cmd.add("mcp_servers." + server.name() + ".tool_timeout_sec=" + com.superagent.runtime.mcp.McpGrants.TOOL_TIMEOUT_SECONDS);
             if (server.token() != null) {
                 cmd.add("-c");
                 cmd.add("mcp_servers." + server.name() + ".bearer_token_env_var=" + jsonString(server.tokenEnvVar()));

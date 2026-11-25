@@ -23,6 +23,7 @@ import com.superagent.core.task.TaskStore;
 import com.superagent.runtime.attachment.ImageAttachmentStore;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -62,10 +63,11 @@ class TaskServiceTest {
 
     private static final class InMemoryTaskStore implements TaskStore {
         private final Map<String, Task> rows = new LinkedHashMap<>();
-        @Override public List<Task> listTasks() { return new ArrayList<>(rows.values()); }
-        @Override public Optional<Task> findTask(String id) { return Optional.ofNullable(rows.get(id)); }
+        // Every method locks: the scheduler, the task runs and the test read and write it from different threads.
+        @Override public synchronized List<Task> listTasks() { return new ArrayList<>(rows.values()); }
+        @Override public synchronized Optional<Task> findTask(String id) { return Optional.ofNullable(rows.get(id)); }
         @Override public synchronized Task save(Task t) { rows.put(t.id(), t); return t; }
-        @Override public void delete(String id) { rows.remove(id); }
+        @Override public synchronized void delete(String id) { rows.remove(id); }
     }
 
     private static final class InMemoryTaskPhaseStore implements TaskPhaseStore {
@@ -130,14 +132,65 @@ class TaskServiceTest {
 
     private static final class InMemoryTaskRunStateStore implements TaskRunStateStore {
         private final Map<String, TaskRunState> rows = new LinkedHashMap<>();
-        @Override public Optional<TaskRunState> find(String id) { return Optional.ofNullable(rows.get(id)); }
+        @Override public synchronized Optional<TaskRunState> find(String id) { return Optional.ofNullable(rows.get(id)); }
         @Override public synchronized TaskRunState save(TaskRunState s) { rows.put(s.taskId(), s); return s; }
-        @Override public void delete(String id) { rows.remove(id); }
+        @Override public synchronized void delete(String id) { rows.remove(id); }
     }
 
     /** A non-coding task, so the generic single-pass flow runs regardless of title wording. */
     private static CreateTaskRequest brief(String title) {
         return new CreateTaskRequest(title, "Do the thing and verify it.", null, "my-repo", "main", null, null, null, "general");
+    }
+
+    @Test
+    void aCodingTaskRunsThroughItsHarnessWorkingApartAndWaitingOnTheUser(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp)
+            throws Exception {
+        java.nio.file.Path repo = java.nio.file.Files.createDirectories(tmp.resolve("app"));
+        for (String[] cmd : new String[][]{{"git", "init", "-q", "-b", "main"},
+                {"git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"}}) {
+            Process p = new ProcessBuilder(cmd).directory(repo.toFile()).redirectErrorStream(true)
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
+            p.getOutputStream().close();
+            assertThat(p.waitFor()).isZero();
+        }
+        List<String> cwds = Collections.synchronizedList(new ArrayList<>());
+        String spec = "## 目标\n加文件\n## 不做\n无\n## 验收标准\n1. 有 x.txt\n## 验证命令\n```\ntest -f x.txt\n```\n";
+        AgentRunner runner = new AgentRunner() {
+            @Override public AgentType type() { return AgentType.CLAUDE; }
+            @Override public void run(AgentRunRequest req, AgentEventSink sink, Cancellation c) {
+                cwds.add(req.workspaceDir());
+                sink.emit(new AgentEvent(req.sessionId(), null, 0, AgentEventType.RESULT, spec, Instant.now()));
+            }
+        };
+        InMemoryTaskStore tasks = new InMemoryTaskStore();
+        TaskService service = service(runner, tasks);
+        service.setHarnesses(List.of(new com.superagent.task.harness.coding.CodingHarness(60)));
+        java.util.Map<String, String> saved = new java.util.HashMap<>();
+        com.superagent.platform.settings.SettingsService settings = new com.superagent.platform.settings.SettingsService(
+                new com.superagent.core.settings.SystemSettingStore() {
+                    @Override public java.util.Map<String, String> all() { return saved; }
+                    @Override public void put(String key, String value) { saved.put(key, value); }
+                }, null);
+        settings.update(new com.superagent.api.settings.SystemSettingsDto(null, null, null, null, null, null, null, null,
+                null, List.of(tmp.toString()))); // local projects are allowed only under the admin's directories
+        service.setSettings(settings);
+
+        String id = service.create(new CreateTaskRequest("加 x.txt", "加一个文件", null, repo.toString(), null, null, null,
+                null, "coding")).id();
+        awaitStatus(tasks, id, "NEEDS_CONFIRMATION");
+        TaskDetailDto d = service.detail(id, "tester");
+        assertThat(d.harness().steps()).extracting(com.superagent.api.task.HarnessDto.Step::status)
+                .containsExactly("done", "done", "waiting", "pending", "pending", "pending", "pending", "pending");
+        assertThat(d.harness().verifyCommands()).containsExactly("test -f x.txt");
+        assertThat(cwds).singleElement().isEqualTo(d.harness().workspace().dir()); // the agent ran in the task's own worktree
+        assertThat(d.harness().workspace().dir()).isNotEqualTo(repo.toString());
+        assertThat(tasks.findTask(id).orElseThrow().workspaceDir()).isNotEqualTo(d.harness().workspace().dir()); // never pooled
+
+        service.sendMessage(id, "tester", "确认"); // approves the spec: development starts
+        await().pollInSameThread().atMost(Duration.ofSeconds(10)).until(() -> service.detail(id, "tester").harness().steps().get(3).status()
+                .equals("waiting")); // the scripted agent changed nothing: the harness says so instead of passing it
+        assertThat(service.detail(id, "tester").harness().specApproved()).isTrue();
+        assertThat(cwds).hasSize(2).allMatch(c -> c.equals(cwds.get(0)));
     }
 
     private static CreateTaskRequest coding(String title) {
@@ -257,6 +310,17 @@ class TaskServiceTest {
     }
 
     @Test
+    void aWritingTasksGenreSurvivesTheLinkCheckOfItsMaterials() {
+        TaskService service = service(new FakeRunner(() -> "done."), new InMemoryTaskStore());
+        service.setHarnesses(List.of(new com.superagent.task.harness.article.ArticleHarness()));
+        service.useScheduler(() -> { });
+        service.useLinkReader((url, user) -> new com.superagent.core.link.LinkContent(url, "课程介绍", "正文", com.superagent.core.link.LinkContent.PUBLIC, true));
+        TaskDto t = service.create(new CreateTaskRequest("缓存方案", "读 https://x.feishu.cn/docx/public，写一份技术方案", null, null, null, null, null, null,
+                "article", null, null, null, null, "技术方案"), "alice");
+        assertThat(service.detail(t.id(), "alice").harness().article().genre()).isEqualTo("技术方案");
+    }
+
+    @Test
     void missingTaskYields404() {
         TaskService service = service(new FakeRunner(() -> "x"), new InMemoryTaskStore());
         assertThatThrownBy(() -> service.detail("nope", "tester")).isInstanceOf(TaskNotFoundException.class);
@@ -309,47 +373,7 @@ class TaskServiceTest {
                 tasks.findTask(b).map(t -> t.status().name()).orElse("").equals("DONE"));
     }
 
-    @Test
-    void codingRunsThreeStepsToDoneWithPrdAndEvidence() {
-        InMemoryTaskStore tasks = new InMemoryTaskStore();
-        InMemoryTaskPhaseStore phases = new InMemoryTaskPhaseStore();
-        AtomicInteger turn = new AtomicInteger();
-        // One turn per phase: PRD markdown, dev summary, acceptance evidence.
-        AgentRunner runner = new FakeRunner(() -> switch (turn.getAndIncrement()) {
-            case 0 -> "## 背景\n...\n## 需求\n...\n## 技术思路\n...";
-            case 1 -> "已修改 app.js、index.html。";
-            default -> "构建通过；关键 DOM 断言通过。";
-        });
-        TaskService service = service(runner, tasks, phases, 50);
 
-        String id = service.create(coding("改一个前端按钮")).id();
-        await().atMost(Duration.ofSeconds(5)).until(() ->
-                tasks.findTask(id).map(t -> t.status().name()).orElse("").equals("DONE"));
-
-        assertThat(tasks.findTask(id).orElseThrow().progress()).isEqualTo(100);
-
-        TaskDetailDto detail = service.detail(id, "tester");
-        assertThat(detail.phases()).hasSize(3);
-        assertThat(detail.phases()).allMatch(p -> p.status().equals("done"));
-        assertThat(detail.phases().get(0).content()).contains("## 背景");   // PRD stored in DB
-        assertThat(detail.phases().get(2).evidence()).isNotBlank();         // acceptance evidence
-    }
-
-    @Test
-    void codingPausesAtGateWhenPrdMissing() {
-        InMemoryTaskStore tasks = new InMemoryTaskStore();
-        // Not a PRD: a summary of something else (what a confused run produced) must not pass as one.
-        TaskService service = service(new FakeRunner(() -> "这个任务其实已经做完了，11 份译文都在 Files 里。"), tasks,
-                new InMemoryTaskPhaseStore(), 50);
-
-        String id = service.create(coding("写点代码")).id();
-        await().atMost(Duration.ofSeconds(5)).until(() ->
-                tasks.findTask(id).map(t -> t.status().name()).orElse("").equals("NEEDS_CONFIRMATION"));
-
-        TaskDetailDto detail = service.detail(id, "tester");
-        assertThat(detail.messages()).anyMatch(m -> m.content().contains("第1步未产出 PRD"));
-        assertThat(detail.phases().get(0).status()).isEqualTo("running"); // stays on the PRD step for resume
-    }
 
     @Test
     void recoverResumesAnOrphanedRunningTask() {
@@ -547,28 +571,6 @@ class TaskServiceTest {
         assertThat(service.detail(c, "tester").task().sessionId()).isEqualTo(b.sessionId());
     }
 
-    @Test
-    void aFailedCodingRunGoesOnInAFreshSessionThatIsGivenTheTaskItsPrdAndTheStep() {
-        InMemoryTaskStore tasks = new InMemoryTaskStore();
-        PromptRunner runner = new PromptRunner(n -> switch (n) {
-            case 0 -> "## 背景\nB\n## 需求\nR1 加按钮\n## 技术思路\nT";
-            case 1 -> null; // the develop step fails
-            default -> "已修改，测试通过。";
-        });
-        TaskService service = service(runner, tasks);
-        String id = service.create(coding("加个按钮")).id();
-        awaitStatus(tasks, id, "ERROR");
-
-        service.recover(id); // the watchdog's action
-        awaitStatus(tasks, id, "DONE");
-
-        PromptRunner.Call failed = runner.calls.get(1), again = runner.calls.get(2);
-        assertThat(again.sessionId()).isNotEqualTo(failed.sessionId()); // a broken conversation isn't resumed
-        assertThat(again.resumeId()).isNull();
-        assertThat(again.workspaceDir()).isEqualTo(failed.workspaceDir());
-        assertThat(again.prompt()).contains(TaskService.FRESH_NOTE, "实现并验收这个前端改动。", "R1 加按钮", "第2步：开发");
-        assertThat(service.detail(id, "tester").phases()).allMatch(p -> p.status().equals("done"));
-    }
 
     @Test
     void afterARestartNewTasksReuseSessionsFinishedTasksLeft() {
@@ -610,6 +612,37 @@ class TaskServiceTest {
         String id = service.create(coding("写点代码")).id();
         awaitStatus(tasks, id, "ERROR");
         assertThat(tasks.findTask(id).orElseThrow().error()).contains("boom: cli crashed");
+    }
+
+    @Test
+    void aFailureTheWatchdogWillRetryIsNotNewsAndTheLastOneIsToldOnceWithModelAndRetries() {
+        InMemoryTaskStore tasks = new InMemoryTaskStore();
+        AgentRunner failing = new AgentRunner() {
+            @Override public AgentType type() { return AgentType.CLAUDE; }
+            @Override public void run(AgentRunRequest req, AgentEventSink sink, Cancellation c) {
+                sink.emit(new AgentEvent(req.sessionId(), null, 0, AgentEventType.ERROR, "boom: cli crashed", Instant.now()));
+            }
+        };
+        List<com.superagent.core.notice.NoticeEvents.TaskStatusChanged> errors = Collections.synchronizedList(new ArrayList<>());
+        TaskService service = new TaskService(tasks, new InMemoryTaskPhaseStore(), new InMemoryTaskRunStateStore(),
+                new InMemoryRunStore(), List.of(failing), IMAGES, System.getProperty("java.io.tmpdir") + "/sa-test-" + UUID.randomUUID(),
+                "", "", false, 50, "tester", null, null, null,
+                e -> { if (e instanceof com.superagent.core.notice.NoticeEvents.TaskStatusChanged t && t.status().equals("error")) errors.add(t); },
+                null);
+        String id = service.create(coding("写点代码")).id();
+        for (int n = 1; n <= 10; n++) {
+            int expected = n;
+            await().atMost(Duration.ofSeconds(5)).until(() -> errors.size() == expected);
+            if (n < 10) {
+                service.recover(id);
+            }
+        }
+        assertThat(errors.subList(0, 9)).allMatch(e -> e.retrying());
+        var last = errors.get(9);
+        assertThat(last.retrying()).isFalse();
+        assertThat(last.error()).contains("已重试 9 次", "boom: cli crashed", "模型");
+        service.recover(id); // budget used up: nothing more is published
+        assertThat(errors).hasSize(10);
     }
 
     /** The user's case: A's session was later taken by B, which now waits for a confirmation. */
@@ -749,6 +782,91 @@ class TaskServiceTest {
         assertThat(service.modelChoices(id, "tester")).extracting(c -> c.by() + ":" + c.model() + "#" + c.seq())
                 .containsExactly("judge:cheap#1", "escalation:strong#2");
         assertThat(service.modelChoices(id, "tester").get(1).reasoning()).contains("not up to it");
+    }
+
+    /**
+     * A harness that stops on something only the user can fix waits on them: no stronger model, no watchdog retry, and
+     * saying "continue" with nothing changed neither logs nor notifies again. A failure that isn't the model's doesn't
+     * move it up either.
+     */
+    @Test
+    void aStopOnWhatOnlyTheUserCanFixIsNeitherEscalatedNorRetriedNorRepeated() {
+        InMemoryTaskStore tasks = new InMemoryTaskStore();
+        InMemoryRunStore runStore = new InMemoryRunStore();
+        List<String> ran = Collections.synchronizedList(new ArrayList<>());
+        AgentRunner runner = new AgentRunner() {
+            @Override public AgentType type() { return AgentType.CLAUDE; }
+            @Override public void run(AgentRunRequest req, AgentEventSink sink, Cancellation c) { ran.add(req.prompt()); }
+        };
+        List<com.superagent.core.notice.NoticeEvents.TaskStatusChanged> notices = Collections.synchronizedList(new ArrayList<>());
+        TaskService service = new TaskService(tasks, new InMemoryTaskPhaseStore(), new InMemoryTaskRunStateStore(), runStore,
+                List.of(runner), IMAGES, System.getProperty("java.io.tmpdir") + "/sa-test-" + UUID.randomUUID(), "", "", false, 50,
+                "tester", null, null, null, e -> {
+                    if (e instanceof com.superagent.core.notice.NoticeEvents.TaskStatusChanged c) {
+                        notices.add(c);
+                    }
+                }, null);
+        List<com.superagent.core.task.TaskModelChoice> kept = Collections.synchronizedList(new ArrayList<>());
+        AtomicInteger escalations = new AtomicInteger();
+        service.setModelSelection(new com.superagent.core.task.TaskModelSelector() {
+            @Override public boolean enabled() { return true; }
+            @Override public Optional<com.superagent.core.task.TaskModelChoice> choose(Task t) {
+                return Optional.of(new com.superagent.core.task.TaskModelChoice(t.id(), 0, "judge", "easy", "fast", "cheap",
+                        "claude", "judge-model", "- cheap", "easy one", Instant.now()));
+            }
+            @Override public Optional<com.superagent.core.task.TaskModelChoice> escalate(Task t, String failure) {
+                escalations.incrementAndGet();
+                return Optional.of(new com.superagent.core.task.TaskModelChoice(t.id(), 0, "escalation", null, "strong",
+                        "strong", "claude", null, null, failure, Instant.now()));
+            }
+        }, new com.superagent.core.task.TaskModelChoiceStore() {
+            @Override public void save(com.superagent.core.task.TaskModelChoice c) { kept.add(c); }
+            @Override public List<com.superagent.core.task.TaskModelChoice> list(String id) {
+                return kept.stream().filter(c -> c.taskId().equals(id)).toList();
+            }
+        });
+        service.setHarnesses(List.of(new com.superagent.task.harness.TaskHarness() {
+            @Override public String kind() { return "general"; }
+            @Override public com.superagent.task.harness.HarnessState start(Task task, String delivery) {
+                var s = new com.superagent.task.harness.HarnessState();
+                s.harness = "general";
+                s.steps = new ArrayList<>(List.of(new com.superagent.task.harness.HarnessState.Step("listen", "听写")));
+                return s;
+            }
+            @Override public void drive(com.superagent.task.harness.HarnessRun run) {
+                var step = run.state().current();
+                if ("坏了".equals(run.reply())) {
+                    run.fail(step, "听写服务出错", false);
+                    return;
+                }
+                run.quietIfAskedAgain(step);
+                run.begin(step);
+                run.note("同时听写：whisper-1");
+                run.waitFor(step, "音频超过 24 MB，服务器没有 ffmpeg");
+            }
+        }));
+
+        String id = service.create(brief("字幕")).id();
+        awaitStatus(tasks, id, "NEEDS_CONFIRMATION");
+        service.recover(id); // what the watchdog would do: nothing, it isn't failed
+        assertThat(tasks.findTask(id).orElseThrow().status().name()).isEqualTo("NEEDS_CONFIRMATION");
+
+        service.sendMessage(id, "tester", "继续");
+        await().atMost(Duration.ofSeconds(5)).until(() -> notices.stream().filter(n -> n.status().equals("needs_confirmation")).count() == 2);
+        awaitStatus(tasks, id, "NEEDS_CONFIRMATION");
+
+        assertThat(notices).filteredOn(n -> n.status().equals("needs_confirmation"))
+                .extracting(com.superagent.core.notice.NoticeEvents.TaskStatusChanged::repeated).containsExactly(false, true);
+        List<String> log = runStore.listEvents(id).stream().map(AgentEvent::payload).toList();
+        assertThat(log).filteredOn(l -> l.contains("ffmpeg")).hasSize(1); // asked once
+        assertThat(log).filteredOn(l -> l.contains("同时听写")).hasSize(1);
+        assertThat(log).filteredOn(l -> l.contains("── 听写")).hasSize(1);
+
+        service.sendMessage(id, "tester", "坏了");
+        awaitStatus(tasks, id, "ERROR");
+        assertThat(escalations).hasValue(0);
+        assertThat(kept).noneMatch(c -> c.by().equals("escalation"));
+        assertThat(ran).isEmpty(); // the harness never needed the task's model
     }
 
     @Test
@@ -910,6 +1028,190 @@ class TaskServiceTest {
         }
     }
 
+    /** A scripted agent for the general flow: the checklist, the work, and the independent checker's verdict. */
+    private static boolean generalTurn(AgentRunRequest req, AgentEventSink sink, List<String> checked) {
+        String p = req.prompt();
+        if (p.startsWith("你是独立检查员")) {
+            // It only judges: read-only tools, nothing that could change the work, no MCP or connectors.
+            assertThat(req.allowedTools()).isEqualTo(TaskService.READ_ONLY_TOOLS);
+            assertThat(req.skipPermissions()).isFalse();
+            assertThat(req.mcpConfig()).isNull();
+            checked.add(req.sessionId());
+            reply(req, sink, "1. ✅ 有结论\nVERDICT: PASS");
+        } else if (p.contains("可以逐条核对的清单")) {
+            reply(req, sink, "## 交付物\n- 结论 | 回复\n\n## 验收标准\n1. 给出结论\n");
+        } else if (p.contains("清单定好了")) {
+            reply(req, sink, "结果：查到了");
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    @Test
+    void aLinkThatFailedOnceAndWasReadLaterCountsAsRead() {
+        java.util.function.BiFunction<Integer, String, AgentEvent> result = (i, text) ->
+                new AgentEvent("t", null, i, AgentEventType.TOOL_RESULT, text, Instant.now());
+        List<AgentEvent> events = List.of(
+                result.apply(0, "读不到 https://a.example/doc/：读取超时。稍后再试"),
+                result.apply(1, "读不到 https://b.example/x：没有权限"),
+                result.apply(2, "《文档 A》\n来源：https://a.example/doc\n读取方式：公开内容，未登录\n以下是内容…"));
+        assertThat(TaskService.unreadableLinks(events)).containsExactly("https://b.example/x");
+        // Read first, failing after: its last read failed.
+        assertThat(TaskService.unreadableLinks(List.of(events.get(2), result.apply(3, "读不到 https://a.example/doc：超时"))))
+                .containsExactly("https://a.example/doc");
+    }
+
+    @Test
+    void aComplexTasksSubtasksAreEachCheckedAndSoIsItsConclusion() {
+        InMemoryTaskStore tasks = new InMemoryTaskStore();
+        InMemoryTaskPhaseStore phases = new InMemoryTaskPhaseStore();
+        java.util.concurrent.atomic.AtomicReference<TaskService> svc = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<String> parentId = new java.util.concurrent.atomic.AtomicReference<>();
+        List<String> checked = Collections.synchronizedList(new ArrayList<>());
+        AgentRunner runner = new AgentRunner() {
+            @Override public AgentType type() { return AgentType.CLAUDE; }
+            @Override public void run(AgentRunRequest req, AgentEventSink sink, Cancellation c) {
+                if (generalTurn(req, sink, checked)) {
+                    return;
+                }
+                if (req.prompt().contains("## 这一轮：拆分")) {
+                    svc.get().createSubtask(parentId.get(), "tester", "第 1 块", "调研第 1 块");
+                    svc.get().createSubtask(parentId.get(), "tester", "第 2 块", "调研第 2 块");
+                    reply(req, sink, "计划：分 2 块");
+                } else {
+                    reply(req, sink, "最终结论：2 块都齐了");
+                }
+            }
+        };
+        TaskService service = service(runner, tasks, phases, 50);
+        service.setLinks(new InMemoryLinks());
+        service.setHarnesses(List.of(new com.superagent.task.harness.general.GeneralHarness()));
+        svc.set(service);
+        Thread loop = schedulerLoop(service);
+        try {
+            String id = service.create(new CreateTaskRequest("两块调研", "分头调研两块，再汇总出结论", null, null, null,
+                    null, null, null, "complex")).id();
+            parentId.set(id);
+            await().atMost(Duration.ofSeconds(15)).until(() -> tasks.findTask(id).orElseThrow().status().name().equals("DONE"));
+
+            List<String> kids = service.relations(id, "tester").subtasks().stream().map(k -> k.id()).toList();
+            assertThat(kids).hasSize(2).allSatisfy(k -> {
+                var h = service.detail(k, "tester").harness();
+                assertThat(h.harness()).isEqualTo("general");
+                assertThat(h.general().checks()).singleElement().satisfies(c -> assertThat(c.passed()).isTrue());
+            });
+            var parent = service.detail(id, "tester").harness();
+            assertThat(parent.harness()).isEqualTo("complex");
+            assertThat(parent.general().checks()).singleElement().satisfies(c -> assertThat(c.verdict()).isEqualTo("PASS"));
+            assertThat(checked).hasSize(3).doesNotHaveDuplicates(); // each check in a conversation of its own
+            assertThat(service.lastAnswer(id)).isEqualTo("最终结论：2 块都齐了");
+        } finally {
+            loop.interrupt();
+        }
+    }
+
+    @Test
+    void anArticleTaskIsCreatedWithTheEightWritingSteps() {
+        InMemoryTaskStore tasks = new InMemoryTaskStore();
+        AgentRunner runner = new AgentRunner() {
+            @Override public AgentType type() { return AgentType.CLAUDE; }
+            @Override public void run(AgentRunRequest req, AgentEventSink sink, Cancellation c) {
+                reply(req, sink, "不会跑到这里");
+            }
+        };
+        TaskService service = service(runner, tasks);
+        service.setHarnesses(List.of(new com.superagent.task.harness.article.ArticleHarness()));
+        service.useScheduler(() -> { }); // recorded, not run
+        String id = service.create(new CreateTaskRequest("写提纲的方法", "写一篇公众号文章，读者是产品经理，1500 字", null, null, null,
+                null, null, null, "article")).id();
+
+        assertThat(tasks.findTask(id).orElseThrow().flow()).isEqualTo("article");
+        var h = service.detail(id, "tester").harness();
+        assertThat(h.harness()).isEqualTo("article");
+        assertThat(h.steps()).extracting(com.superagent.api.task.HarnessDto.Step::key)
+                .containsExactly("brief", "research", "outline", "draft", "check", "review", "revise", "deliver");
+        assertThat(h.article()).isNotNull();
+        assertThat(h.general()).isNull();
+        assertThat(h.article().genre()).isNull();
+
+        String withGenre = service.create(new CreateTaskRequest("缓存方案", "写一份技术方案", null, null, null, null, null, null, "article",
+                null, null, null, null, "技术方案")).id();
+        assertThat(service.detail(withGenre, "tester").harness().article().genre()).isEqualTo("技术方案");
+    }
+
+    @Test
+    void aComplexTaskFromBeforeTheCheckIsSummedUpAsItWas() {
+        InMemoryTaskStore tasks = new InMemoryTaskStore();
+        java.util.concurrent.atomic.AtomicReference<TaskService> svc = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<String> parentId = new java.util.concurrent.atomic.AtomicReference<>();
+        List<String> checked = Collections.synchronizedList(new ArrayList<>());
+        AgentRunner runner = new AgentRunner() {
+            @Override public AgentType type() { return AgentType.CLAUDE; }
+            @Override public void run(AgentRunRequest req, AgentEventSink sink, Cancellation c) {
+                if (generalTurn(req, sink, checked)) {
+                    return;
+                }
+                if (req.prompt().contains("## 这一轮：拆分")) {
+                    svc.get().createSubtask(parentId.get(), "tester", "第 1 块", "调研第 1 块");
+                    reply(req, sink, "计划：1 块");
+                } else {
+                    reply(req, sink, "最终结论：齐了");
+                }
+            }
+        };
+        TaskService service = service(runner, tasks);
+        service.setLinks(new InMemoryLinks());
+        svc.set(service);
+        service.useScheduler(() -> { }); // recorded, not run yet
+        String id = service.create(new CreateTaskRequest("旧复杂任务", "调研再汇总", null, null, null,
+                null, null, null, "complex")).id();
+        parentId.set(id);
+        service.setHarnesses(List.of(new com.superagent.task.harness.general.GeneralHarness())); // the new version starts
+        Thread loop = schedulerLoop(service);
+        try {
+            await().atMost(Duration.ofSeconds(15)).until(() -> tasks.findTask(id).orElseThrow().status().name().equals("DONE"));
+            assertThat(service.detail(id, "tester").harness()).isNull();
+            assertThat(service.lastAnswer(id)).isEqualTo("最终结论：齐了");
+            assertThat(checked).hasSize(1); // its new subtask is checked; its conclusion isn't
+        } finally {
+            loop.interrupt();
+        }
+    }
+
+    @Test
+    void aNewGeneralTaskRunsTheFourStepsWhileOneFromBeforeKeepsItsSinglePassAndPage() {
+        InMemoryTaskStore tasks = new InMemoryTaskStore();
+        InMemoryTaskPhaseStore phases = new InMemoryTaskPhaseStore();
+        List<String> checked = Collections.synchronizedList(new ArrayList<>());
+        AgentRunner runner = new AgentRunner() {
+            @Override public AgentType type() { return AgentType.CLAUDE; }
+            @Override public void run(AgentRunRequest req, AgentEventSink sink, Cancellation c) {
+                if (!generalTurn(req, sink, checked)) {
+                    reply(req, sink, "交付完成：单轮执行。");
+                }
+            }
+        };
+        TaskService service = service(runner, tasks, phases, 50); // no general harness yet
+        String old = service.create(brief("Old task")).id();
+        await().atMost(Duration.ofSeconds(5)).until(() -> tasks.findTask(old).orElseThrow().status().name().equals("DONE"));
+
+        service.setHarnesses(List.of(new com.superagent.task.harness.general.GeneralHarness()));
+        TaskDetailDto oldPage = service.detail(old, "tester");
+        assertThat(oldPage.harness()).isNull();
+        assertThat(oldPage.phases()).isEmpty();
+        assertThat(oldPage.events()).isNotEmpty();
+
+        String id = service.create(brief("New task")).id();
+        await().atMost(Duration.ofSeconds(5)).until(() -> tasks.findTask(id).orElseThrow().status().name().equals("DONE"));
+        var h = service.detail(id, "tester").harness();
+        assertThat(h.steps()).extracting(com.superagent.api.task.HarnessDto.Step::status).containsOnly("done");
+        assertThat(h.criteria()).singleElement().satisfies(c -> assertThat(c.met()).isTrue());
+        assertThat(h.general().reply()).isEqualTo("结果：查到了"); // the agent's own summary, not the checker's verdict
+        assertThat(checked).hasSize(1);
+        assertThat(service.lastAnswer(id)).contains("结果：查到了", "独立检查 PASS");
+    }
+
     @Test
     void aSubtaskThatKeepsFailingIsRetriedThenReplacedAndTheConclusionNamesTheGap() {
         InMemoryTaskStore tasks = new InMemoryTaskStore();
@@ -1004,5 +1306,113 @@ class TaskServiceTest {
         service.setTags(second, "tester", List.of("竞品"));
         assertThat(service.page("tester", null, "定价", null, null, 1, 20).items()).extracting(TaskDto::id).containsExactly(first);
         assertThat(service.facets("tester").tags()).extracting(f -> f.key() + "×" + f.count()).containsExactly("竞品×2", "定价×1");
+    }
+
+    @Test
+    void projectTasksCarryTheProjectContextAndListItsReposFirst() {
+        List<String> prompts = Collections.synchronizedList(new ArrayList<>());
+        AgentRunner runner = new AgentRunner() {
+            @Override public AgentType type() { return AgentType.CLAUDE; }
+            @Override public void run(AgentRunRequest req, AgentEventSink sink, Cancellation c) {
+                prompts.add(req.prompt() + "\n@@\n" + req.systemPrompt());
+                sink.emit(new AgentEvent(req.sessionId(), null, 0, AgentEventType.RESULT, "交付完成。", Instant.now()));
+            }
+        };
+        InMemoryTaskStore tasks = new InMemoryTaskStore();
+        TaskService service = service(runner, tasks, 1); // one pool session: the second task reuses it
+        com.superagent.core.project.ProjectAccess projects = org.mockito.Mockito.mock(com.superagent.core.project.ProjectAccess.class);
+        org.mockito.Mockito.when(projects.context(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(i -> tasks.findTask(i.getArgument(1)).filter(t -> t.title().equals("项目里的活")).isPresent() ? Optional.of("## 项目共同上下文（项目「看板」）\n约定：金额两位小数")
+                        : Optional.empty());
+        org.mockito.Mockito.when(projects.reposOfAgent("a1")).thenReturn(List.of(new com.superagent.core.project.ProjectRepo(
+                "r1", "p1", "api", "/code/api", "main", "pr", "后端服务", 0, Instant.now(), Instant.now())));
+        service.setProjects(projects);
+
+        String first = service.create(new CreateTaskRequest("项目里的活", "项目里的活：做完并验证。", null, "my-repo", "main", null, null, null, "general")).id();
+        await().atMost(Duration.ofSeconds(5)).until(() -> tasks.findTask(first).map(t -> t.status().name()).orElse("").equals("DONE"));
+        String second = service.create(new CreateTaskRequest("项目外的活", "项目外的活：做完并验证。", null, "my-repo", "main", null, null, null, "general")).id();
+        await().atMost(Duration.ofSeconds(5)).until(() -> tasks.findTask(second).map(t -> t.status().name()).orElse("").equals("DONE"));
+
+        assertThat(prompts.stream().filter(p -> p.contains("项目里的活"))).isNotEmpty().allMatch(p -> p.contains("金额两位小数"));
+        assertThat(prompts.stream().filter(p -> p.contains("项目外的活"))).isNotEmpty().noneMatch(p -> p.contains("项目共同上下文"));
+        assertThat(TaskService.withToolRules("做事", true)).contains("【交付规则】", "【沉淀规则】", "agent_memory_write");
+        assertThat(TaskService.withToolRules("做事", false)).isEqualTo("做事");
+
+        String targets = service.codingTargets("tester", "a1");
+        assertThat(targets).startsWith("本项目的仓库").contains("api：/code/api", "交付方式 pr", "后端服务", "每个仓库建一个子任务");
+        assertThat(service.codingTargets("tester", "a2")).doesNotContain("本项目的仓库").contains("最近用过的代码位置");
+    }
+
+    @Test
+    void handoverKeepsPendingAndWaitingTasksRunningOnlyStopsActiveOnes() {
+        InMemoryTaskStore tasks = new InMemoryTaskStore();
+        TaskService service = service(new FakeRunner(() -> "done."), tasks);
+        Instant now = Instant.now();
+        tasks.save(new Task("t-wait", "waiting parent", "brief", com.superagent.core.task.TaskSource.TASK_FORM,
+                "repo", "main", null, com.superagent.core.task.TaskStatus.WAITING, 40, BigDecimal.ZERO,
+                "m", AgentType.CLAUDE, "/ws", "alice", null, now, now, null, now));
+        tasks.save(new Task("t-pend", "queued", "brief", com.superagent.core.task.TaskSource.TASK_FORM,
+                "repo", "main", null, com.superagent.core.task.TaskStatus.PENDING, 0, BigDecimal.ZERO,
+                "m", AgentType.CLAUDE, null, "alice", null, now, null, null, now));
+        tasks.save(new Task("t-run", "active", "brief", com.superagent.core.task.TaskSource.TASK_FORM,
+                "repo", "main", null, com.superagent.core.task.TaskStatus.RUNNING, 20, BigDecimal.ZERO,
+                "m", AgentType.CLAUDE, "/ws", "alice", null, now, now, null, now));
+        tasks.save(new Task("t-confirm", "confirm", "brief", com.superagent.core.task.TaskSource.TASK_FORM,
+                "repo", "main", null, com.superagent.core.task.TaskStatus.NEEDS_CONFIRMATION, 60, BigDecimal.ZERO,
+                "m", AgentType.CLAUDE, "/ws", "alice", null, now, now, null, now));
+
+        TaskService.TaskHandoverResult result = service.transferOwnership("alice", "bob");
+
+        assertThat(result.stopped()).isEqualTo(2);
+        assertThat(result.reassigned()).isEqualTo(4);
+        assertThat(tasks.findTask("t-wait").orElseThrow().status()).isEqualTo(com.superagent.core.task.TaskStatus.WAITING);
+        assertThat(tasks.findTask("t-wait").orElseThrow().createdBy()).isEqualTo("bob");
+        assertThat(tasks.findTask("t-pend").orElseThrow().status()).isEqualTo(com.superagent.core.task.TaskStatus.PENDING);
+        assertThat(tasks.findTask("t-pend").orElseThrow().createdBy()).isEqualTo("bob");
+        assertThat(tasks.findTask("t-run").orElseThrow().status()).isEqualTo(com.superagent.core.task.TaskStatus.STOPPED);
+        assertThat(tasks.findTask("t-run").orElseThrow().createdBy()).isEqualTo("bob");
+        assertThat(tasks.findTask("t-confirm").orElseThrow().status()).isEqualTo(com.superagent.core.task.TaskStatus.STOPPED);
+        assertThat(tasks.findTask("t-confirm").orElseThrow().createdBy()).isEqualTo("bob");
+    }
+
+    @Test
+    void handoverRequeuesPendingWorkSoSuccessorCanStartIt() throws Exception {
+        InMemoryTaskStore tasks = new InMemoryTaskStore();
+        CountDownLatch hold = new CountDownLatch(1);
+        AgentRunner slow = new AgentRunner() {
+            @Override public AgentType type() { return AgentType.CLAUDE; }
+            @Override public void run(AgentRunRequest req, AgentEventSink sink, Cancellation c) {
+                try {
+                    // First turn holds the owner's only slot; later turns (successor) finish.
+                    if (!hold.await(5, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("handover test latch timed out");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                if (c.isCancelled()) {
+                    return;
+                }
+                sink.emit(new AgentEvent(req.sessionId(), null, 0, AgentEventType.RESULT, "done", Instant.now()));
+            }
+        };
+        TaskService service = service(slow, tasks, 1); // alice at parallel cap after the first starts
+        String running = service.create(brief("holds slot"), "alice").id();
+        await().atMost(Duration.ofSeconds(3)).until(() ->
+                tasks.findTask(running).map(t -> t.status().name()).orElse("").equals("RUNNING"));
+        String queued = service.create(brief("waiting in queue"), "alice").id();
+        await().atMost(Duration.ofSeconds(2)).until(() ->
+                tasks.findTask(queued).map(t -> t.status() == com.superagent.core.task.TaskStatus.PENDING
+                        && t.workspaceDir() == null).orElse(false));
+
+        service.transferOwnership("alice", "bob");
+        hold.countDown(); // release the cancelled first turn
+
+        await().atMost(Duration.ofSeconds(5)).until(() ->
+                tasks.findTask(queued).map(t -> t.status().name()).orElse("").equals("DONE"));
+        assertThat(tasks.findTask(queued).orElseThrow().createdBy()).isEqualTo("bob");
+        assertThat(tasks.findTask(running).orElseThrow().status())
+                .isIn(com.superagent.core.task.TaskStatus.STOPPED, com.superagent.core.task.TaskStatus.DONE);
+        assertThat(tasks.findTask(running).orElseThrow().createdBy()).isEqualTo("bob");
     }
 }

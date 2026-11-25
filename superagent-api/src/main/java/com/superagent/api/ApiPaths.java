@@ -28,7 +28,10 @@ public final class ApiPaths {
     /** Work files: what agents produced (documents, images, videos). */
     public static final String FILES = V1 + "/files";
     public static final String PROJECTS = V1 + "/projects";
+    /** How the company's and each project's names and terms are written (subtitles spell by it). */
+    public static final String GLOSSARY = V1 + "/glossary";
     public static final String FILE_FOLDERS = FILES + "/folders";
+    public static final String PROJECT_FOLDERS = FILES + "/project-folders";
 
     /** Saved prompts that run as tasks by schedule or API call. */
     public static final String AUTOMATIONS = V1 + "/automations";
@@ -48,6 +51,11 @@ public final class ApiPaths {
     public static final String ANALYTICS = V1 + "/admin/analytics";
     /** The caller's own token usage. */
     public static final String USAGE = V1 + "/usage";
+    /** "Confirm for me": the caller's rules and records. */
+    public static final String PROXY_CONFIRM = V1 + "/proxy-confirm";
+    /** Every proxy confirmation in the company (admins, read-only). */
+    public static final String ADMIN_PROXY_CONFIRM = V1 + "/admin/proxy-confirm";
+
     /** Everyone's token usage (admins). */
     public static final String ADMIN_USAGE = V1 + "/admin/usage";
 
@@ -80,6 +88,9 @@ public final class ApiPaths {
 
     /** The signed-in user's to-do home page: decisions, actions, finished work, heads-ups. */
     public static final String NOTICES = V1 + "/notices";
+
+    /** Admin employee handover: preview and execute ownership transfer. */
+    public static final String HANDOVER = V1 + "/admin/handover";
 
     private ApiPaths() {
     }

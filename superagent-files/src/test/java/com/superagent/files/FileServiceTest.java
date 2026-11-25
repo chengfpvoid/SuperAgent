@@ -53,7 +53,7 @@ class FileServiceTest {
         com.superagent.core.tenant.TenantContext.clear();
     }
 
-    private static final class InMemoryFiles implements WorkFileStore {
+    static final class InMemoryFiles implements WorkFileStore {
         final Map<String, WorkFile> rows = new LinkedHashMap<>();
         final Map<String, Set<String>> refs = new LinkedHashMap<>();
         @Override public void save(WorkFile f) { rows.put(f.id(), f); }
@@ -111,7 +111,7 @@ class FileServiceTest {
     private final Map<String, String> settingRows = new LinkedHashMap<>();
     private final InMemoryFolders folderStore = new InMemoryFolders();
 
-    private static final class InMemoryFolders implements com.superagent.core.file.FileFolderStore {
+    static final class InMemoryFolders implements com.superagent.core.file.FileFolderStore {
         final Map<String, com.superagent.core.file.FileFolder> rows = new LinkedHashMap<>();
         final Map<String, Map<String, String>> placed = new HashMap<>();
         @Override public void save(com.superagent.core.file.FileFolder f) { rows.put(f.id(), f); }
@@ -124,6 +124,11 @@ class FileServiceTest {
         @Override public Map<String, String> placements(String owner) { return new HashMap<>(placed.getOrDefault(owner, Map.of())); }
         @Override public void place(String owner, String fileId, String folderId, String by) {
             placed.computeIfAbsent(owner, k -> new HashMap<>()).put(fileId, folderId); }
+        @Override public void transferPlacements(String fromOwner, String toOwner) {
+            Map<String, String> from = placed.remove(fromOwner);
+            if (from == null || from.isEmpty()) return;
+            placed.computeIfAbsent(toOwner, k -> new HashMap<>()).putAll(from);
+        }
     }
 
     private FileStorageService storage;
@@ -394,7 +399,7 @@ class FileServiceTest {
         InMemoryFiles store = new InMemoryFiles();
         FileService svc = service(store);
         FileFolderService folders = new FileFolderService(folderStore, svc);
-        FileFolderMcpTools tidy = new FileFolderMcpTools(svc, folders);
+        FileFolderMcpTools tidy = new FileFolderMcpTools(svc, folders, new ProjectFolderService(new ProjectFolderServiceTest.InMemoryProjectFolders(), svc));
         FileManageMcpTools manage = new FileManageMcpTools(svc);
         var json = new com.fasterxml.jackson.databind.ObjectMapper();
         var chat = new com.superagent.runtime.mcp.McpGrants.Grant("t", com.superagent.runtime.mcp.McpGrants.Kind.CHAT, "bob", null, "dev", "s", "m", null);

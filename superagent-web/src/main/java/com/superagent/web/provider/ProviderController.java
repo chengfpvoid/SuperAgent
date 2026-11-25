@@ -6,9 +6,11 @@ import com.superagent.api.provider.AddProviderRequest;
 import com.superagent.api.provider.CatalogEntryDto;
 import com.superagent.api.provider.ProviderDto;
 import com.superagent.api.provider.CredentialDto;
+import com.superagent.api.provider.CredentialImportDto;
 import com.superagent.api.provider.CredentialRequests;
 import com.superagent.api.provider.NodeRuntimeDto;
 import com.superagent.platform.provider.CredentialService;
+import com.superagent.platform.provider.FfmpegService;
 import com.superagent.platform.provider.NodeRuntimeService;
 import com.superagent.platform.provider.ProviderService;
 import com.superagent.platform.tenant.CompanyService;
@@ -30,10 +32,12 @@ public class ProviderController {
     private final NodeRuntimeService node;
     private final CredentialService credentials;
     private final CompanyService companies;
+    private final FfmpegService ffmpeg;
 
     public ProviderController(ProviderService service, NodeRuntimeService node, CredentialService credentials,
-                              CompanyService companies) {
+                              CompanyService companies, FfmpegService ffmpeg) {
         this.companies = companies;
+        this.ffmpeg = ffmpeg;
         this.service = service;
         this.node = node;
         this.credentials = credentials;
@@ -60,6 +64,23 @@ public class ProviderController {
     @GetMapping(ApiPaths.PROVIDERS + "/node/install-log")
     public ApiResponse<com.superagent.api.provider.InstallLogDto> nodeInstallLog() {
         return ApiResponse.ok(node.installLog());
+    }
+
+    /** The server's ffmpeg (subtitles and transcription convert and cut audio with it): there or not, and its version. */
+    @GetMapping(ApiPaths.PROVIDERS + "/ffmpeg")
+    public ApiResponse<com.superagent.api.provider.FfmpegDto> ffmpeg() {
+        return ApiResponse.ok(ffmpeg.status());
+    }
+
+    /** Installs ffmpeg with the system's package manager; runs in the background, poll {@link #ffmpeg()}. */
+    @PostMapping(ApiPaths.PROVIDERS + "/ffmpeg/install")
+    public ApiResponse<com.superagent.api.provider.FfmpegDto> installFfmpeg() {
+        return ApiResponse.ok(ffmpeg.install());
+    }
+
+    @GetMapping(ApiPaths.PROVIDERS + "/ffmpeg/install-log")
+    public ApiResponse<com.superagent.api.provider.InstallLogDto> ffmpegInstallLog() {
+        return ApiResponse.ok(ffmpeg.installLog());
     }
 
     /** What the last install / upgrade of this CLI did and printed. */
@@ -131,6 +152,19 @@ public class ProviderController {
     public ApiResponse<Void> deleteCredential(@PathVariable String id, @PathVariable String cid) {
         credentials.delete(service.keyOf(id), cid);
         return ApiResponse.empty();
+    }
+
+    /**
+     * Imports the keys this server already has — the CLI's own config (e.g. {@code ~/.claude/settings.json}, where a
+     * switcher like cc-switch keeps them) and the environment — into the company's pool. Keys already in the pool are
+     * left alone, so pressing it twice changes nothing.
+     */
+    @PostMapping(ApiPaths.PROVIDERS + "/{id}/credentials/import")
+    public ApiResponse<CredentialImportDto> importCredentials(@PathVariable String id) {
+        String key = service.keyOf(id);
+        CredentialService.MachineImport result = credentials.importMachine(key);
+        return ApiResponse.ok(new CredentialImportDto(result.found(), result.added(), result.kept(), result.deleted(),
+                result.sources(), credentials.list(key)));
     }
 
     /** One real inference through this key now (the result also decides whether runs use it). */

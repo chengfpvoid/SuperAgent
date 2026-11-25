@@ -79,7 +79,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * runtime, so this module stays independent of them.
  */
 @Service
-public class ChatService {
+public class ChatService implements org.springframework.context.SmartLifecycle {
 
     private static final Logger log = LoggerFactory.getLogger(ChatService.class);
 
@@ -91,6 +91,11 @@ public class ChatService {
     private final Map<String, Cancellation> activeRuns = new ConcurrentHashMap<>();
     /** The turn in flight per agent (or per session, for agent-less chats) — one at a time, visible to every member. */
     private final Map<String, LiveTurn> liveTurns = new ConcurrentHashMap<>();
+    /** The stream event that ends a reply the server's shutdown cut short; the page asks the user to send it again. */
+    static final String INTERRUPTED = "interrupted";
+    static final String SERVER_RESTART = "server_restart";
+    private volatile boolean lifecycleRunning;
+    private volatile boolean shuttingDown;
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "agent-turn");
         t.setDaemon(true);
@@ -105,8 +110,6 @@ public class ChatService {
     private final FileService files;
     private final String defaultModel;
     private final List<String> allowedTools;
-    /** A message at least this long is kept as a file of the agent's (see FileService#keepPasted). */
-    static final int LONG_PASTE_CHARS = 3_000;
     private final boolean skipPermissions;
     private final long sseTimeoutMs;
     private final McpGrants mcpGrants;   // null = chat agents get no SuperAgent MCP
@@ -121,6 +124,14 @@ public class ChatService {
         this.modelRouter = modelRouter;
     }
     private com.superagent.core.usage.UsageRecorder usage; // null in tests: tokens aren't kept
+    private com.superagent.core.usage.UsageStore usageStore; // null in tests: only turn counts switch sessions
+    /** sessionId → summary of the session it replaced, read once by the new session's first turn. */
+    private final Map<String, String> handoffs = new ConcurrentHashMap<>();
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setUsageStore(com.superagent.core.usage.UsageStore usageStore) {
+        this.usageStore = usageStore;
+    }
 
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     void setUsageRecorder(com.superagent.core.usage.UsageRecorder usage) {
@@ -345,9 +356,58 @@ public class ChatService {
             if (switching) {
                 memory.consolidateSoon(agent);
             }
+        } else {
+            String tooLong = tooLong(current);
+            if (tooLong != null) {
+                current = rotateForLength(agent, current, model, tooLong);
+            }
         }
         memory.recordModel(agent, model);
         return current;
+    }
+
+    /**
+     * Why {@code session} has grown too long for the next turn (the largest context a single request of its last turn
+     * read, or turn count), else null. The sum over a turn's requests is not the context: each tool call re-reads the
+     * whole conversation, so a long turn books its context several times over.
+     */
+    private String tooLong(ChatSession session) {
+        int maxTokens = settingsService.chatSessionMaxTokens();
+        com.superagent.core.usage.UsageRecord last = usageStore == null ? null
+                : usageStore.latestChatTurn(session.id());
+        long context = last == null ? 0 : last.contextTokens();
+        if (context > maxTokens) {
+            return "上一轮单次请求的上下文有 " + context + " token，超过阈值 " + maxTokens;
+        }
+        int maxTurns = settingsService.chatSessionMaxTurns();
+        long turns = store.listMessages(session.id()).stream().filter(m -> m.role() == MessageRole.ASSISTANT).count();
+        return turns > maxTurns ? "会话已有 " + turns + " 轮，超过阈值 " + maxTurns : null;
+    }
+
+    /** Moves a too-long session to a fresh one, carrying a cheap-model summary of it; the turn never fails for want of one. */
+    private ChatSession rotateForLength(Agent agent, ChatSession old, String model, String why) {
+        java.util.concurrent.atomic.AtomicReference<String> failed = new java.util.concurrent.atomic.AtomicReference<>();
+        String summary = null;
+        try {
+            summary = memory.handoff(agent, store.listMessages(old.id()), AgentMemoryService.HANDOFF_TIMEOUT, failed::set);
+        } catch (RuntimeException e) {
+            failed.set(e.getMessage());
+        }
+        ChatSession fresh = startSession(agent, old.workspaceDir(), model, ChatSession.TOO_LONG);
+        if (summary != null) {
+            handoffs.put(fresh.id(), summary);
+        }
+        log.info("agent {} moved to fresh session {}: {}", agent.id(), fresh.id(), why);
+        String detail = summary != null ? "新会话从交接摘要、Agent 记忆和最近的对话原文继续"
+                : "交接摘要未生成（" + failed.get() + "），新会话只从 Agent 记忆和最近的对话原文继续";
+        String text = "会话过长，已切换到新会话 #" + sessionNumber(agent.id(), fresh.id()) + "：" + why;
+        if (summary != null) {
+            runLog.info(agent, AgentLogService.SESSION, text, detail);
+        } else {
+            runLog.warn(agent, AgentLogService.SESSION, text, detail);
+        }
+        memory.consolidateSoon(agent);
+        return fresh;
     }
 
     /**
@@ -487,11 +547,23 @@ public class ChatService {
         if (user == null || session.agentId() == null || session.agentId().isBlank()) {
             return false;
         }
-        return agentStore.find(session.agentId())
+        return canOpenAgent(session.agentId(), user);
+    }
+
+    private boolean canOpenAgent(String agentId, String user) {
+        return agentStore.find(agentId)
                 .filter(a -> user.equals(a.owner())
                         || members.members(a.id()).stream().anyMatch(m -> m.username().equals(user))
                         || (projects != null && projects.sharesProject(a.id(), user)))
                 .isPresent();
+    }
+
+    /** The agents the user can open that are answering right now, so the sidebar can mark them while they look elsewhere. */
+    public List<String> replyingAgents(String user) {
+        if (user == null) {
+            return List.of();
+        }
+        return liveTurns.keySet().stream().filter(id -> canOpenAgent(id, user)).toList();
     }
 
     // --- sending a message (streamed) ---
@@ -529,12 +601,23 @@ public class ChatService {
             throw new IllegalArgumentException("这个 Agent 所在的项目已归档，只能查看，不能再对话");
         }
         // One turn at a time: in a shared agent, another member's turn may be running.
+        // Occupy the slot *before* sessionForTurn so the too-long check (which may block up to 90s waiting
+        // for a handoff summary) doesn't widen the race window between the busy-check and the reservation.
         String liveKey = agent != null ? agent.id() : sessionId;
-        LiveTurn running = liveTurns.get(liveKey);
-        if (running != null) {
-            throw new ChatBusyException(running.byName() + " 触发的回复正在进行中，请稍候");
+        LiveTurn earlyLive = agent != null ? new LiveTurn(user, displayName(user), Instant.now()) : null;
+        if (earlyLive != null) {
+            LiveTurn existing = liveTurns.putIfAbsent(liveKey, earlyLive);
+            if (existing != null) {
+                throw new ChatBusyException(existing.byName() + " 触发的回复正在进行中，请稍候");
+            }
+        } else {
+            LiveTurn running = liveTurns.get(liveKey);
+            if (running != null) {
+                throw new ChatBusyException(running.byName() + " 触发的回复正在进行中，请稍候");
+            }
         }
         String model = resolveModel(agent);
+        try {
         if (agent != null) {
             // The agent's current session, or a new one if the model changed; never an older one the page still shows.
             session = sessionForTurn(agent, model);
@@ -547,17 +630,20 @@ public class ChatService {
         if (runner == null) {
             throw new IllegalStateException("No runner for agent type " + agentType);
         }
-        // Character first, then the index of the agent's skills (their full text is read on demand).
-        String systemPrompt;
+        // Character first, then its project's shared context (every turn, so a resumed session sees it current),
+        // then the index of the agent's skills (their full text is read on demand).
+        String basePrompt;
         if (special != null) {
-            systemPrompt = special.systemPrompt(agent);
+            basePrompt = special.systemPrompt(agent);
         } else {
-            String character = agent == null ? null : AgentCharacters.systemPrompt(agent);
             String skillIndex = skills.install(session.workspaceDir(),
                     agent == null ? List.of() : skills.forAgent(agent.id(), agent.owner()), mcpGrants != null);
-            systemPrompt = joinPrompt(joinPrompt(joinPrompt(character, skillIndex), mcpGrants == null ? null : McpGrants.FILES_HINT),
+            basePrompt = joinPrompt(joinPrompt(joinPrompt(characterAndProject(agent, projects), skillIndex),
+                            toolRules(mcpGrants != null)),
                     worksInTasks(agent) ? ChatTaskResults.GUIDE : null);
         }
+
+        final String systemPrompt = joinPrompt(basePrompt, styleGuidePrompt(agent, content));
 
         // Images are stored under the user message's id before it's appended, so a bad upload stores nothing.
         String userMessageId = UUID.randomUUID().toString();
@@ -569,21 +655,10 @@ public class ChatService {
         }
         String text = content == null ? "" : content;
         store.appendMessage(new ChatMessage(userMessageId, sessionId, MessageRole.USER, text, Instant.now(), user));
-        String keptAs = null;
         if (agent != null) {
             files.saveLinks(user, agent.id(), null, sessionId, userMessageId, text); // links are resources too
-            if (text.strip().length() >= LONG_PASTE_CHARS) {
-                // A long paste (an outline, a spec) is material: kept whole in the agent's files, it outlives this
-                // session, and tasks and later sessions can read it instead of a truncated copy.
-                com.superagent.core.file.WorkFile kept = files.keepPasted(user, agent.id(), sessionId, userMessageId, text);
-                keptAs = "（系统：这段长文已自动存为文件「" + kept.name() + "」，id " + kept.id()
-                        + "。开任务要用它时，在任务说明里写上这个文件 id，不要只说「用户发的内容」。）";
-            }
         }
         String prompt = text.isBlank() && !attached.isEmpty() ? ImageAttachmentStore.IMAGE_ONLY_PROMPT : text;
-        if (keptAs != null) {
-            prompt = prompt + "\n\n" + keptAs;
-        }
         if (delivered != null) {
             prompt = (text.isBlank() && attached.isEmpty() ? "" : prompt + "\n\n") + delivered.note();
         }
@@ -595,9 +670,21 @@ public class ChatService {
         SseEmitter emitter = new SseEmitter(sseTimeoutMs);
         String assistantMessageId = UUID.randomUUID().toString();
         Cancellation cancellation = new Cancellation();
-        LiveTurn live = new LiveTurn(user, displayName(user), Instant.now());
-        if (liveTurns.putIfAbsent(liveKey, live) != null) {
-            throw new ChatBusyException("另一条消息刚刚触发了回复，请稍候");
+        if (shuttingDown) {
+            liveTurns.remove(liveKey, earlyLive); // release the early reservation
+            throw new ChatBusyException("服务正在重启，请稍后再发送");
+        }
+        // Upgrade the early placeholder (no-agent sessions didn't reserve yet).
+        LiveTurn live;
+        if (earlyLive != null) {
+            live = earlyLive;
+            live.sender(emitter);
+        } else {
+            live = new LiveTurn(user, displayName(user), Instant.now());
+            live.sender(emitter);
+            if (liveTurns.putIfAbsent(liveKey, live) != null) {
+                throw new ChatBusyException("另一条消息刚刚触发了回复，请稍候");
+            }
         }
         activeRuns.put(sessionId, cancellation);
 
@@ -605,7 +692,7 @@ public class ChatService {
         // A session's first turn starts from memory plus the latest messages; later turns resume their history
         // (the memory alone still rides along, for when the CLI has to start over on its own).
         String agentMemory = agent == null ? null
-                : session.agentSessionId() == null ? memory.context(agent, Set.of(userMessageId), user) : memory.read(agent);
+                : session.agentSessionId() == null ? memory.context(agent, Set.of(userMessageId), user, handoffs.remove(session.id())) : memory.read(agent);
         String turnPrompt = prompt;
         executor.execute(TenantContext.wrap(() -> {
             try {
@@ -617,6 +704,45 @@ public class ChatService {
             }
         }));
         return emitter;
+        } catch (RuntimeException | Error e) {
+            // sessionForTurn or other setup threw: release the early reservation so the next message isn't blocked
+            liveTurns.remove(liveKey, earlyLive);
+            throw e;
+        }
+    }
+
+    /** How to use the platform tools, for a chat that has them: hand results over as files, settle what's learnt. */
+    static String toolRules(boolean withTools) {
+        return withTools ? McpGrants.FILES_HINT + "\n\n" + McpGrants.SETTLE_HINT : null;
+    }
+
+    /** Who the agent is, then the shared context of its project (none outside a project). */
+    static String characterAndProject(Agent agent, com.superagent.core.project.ProjectAccess projects) {
+        if (agent == null) {
+            return null;
+        }
+        String project = projects == null ? null : projects.context(agent.id(), null).orElse(null);
+        return joinPrompt(AgentCharacters.systemPrompt(agent), project);
+    }
+
+    private com.superagent.core.writing.StyleGuideSource styleGuide; // null in tests: no document standard
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setStyleGuide(com.superagent.core.writing.StyleGuideSource styleGuide) {
+        this.styleGuide = styleGuide;
+    }
+
+    /** The company's document standard, in every conversation (not only where an agent has the skill). */
+    String styleGuidePrompt(Agent agent, String message) {
+        return styleGuide(styleGuide, agent == null ? "" : agent.name() + " " + (agent.persona() == null ? "" : agent.persona()), message);
+    }
+
+    static String styleGuide(com.superagent.core.writing.StyleGuideSource source, String agentText, String message) {
+        if (source == null) {
+            return null;
+        }
+        boolean technical = com.superagent.core.writing.StyleGuideSource.looksTechnical(agentText + " " + (message == null ? "" : message));
+        return source.compactGuide(technical).orElse(null);
     }
 
     private static String joinPrompt(String a, String b) {
@@ -761,6 +887,9 @@ public class ChatService {
             persistSessionUpdate(attempt.session(), agentType, attempt.agentSessionId(), prompt);
             logTurn(agent, model, startedAt, attempt, retried, cancellation.isCancelled());
 
+            if (emitter.live().interrupted()) {
+                return; // shutdown already ended this reply's streams
+            }
             if (attempt.error() != null && !cancellation.isCancelled()) {
                 send(emitter, new StreamEventDto("error", -1, attempt.error()));
             }
@@ -777,10 +906,15 @@ public class ChatService {
                         storedReply("", detail, false), Instant.now()));
                 saveTiming(emitter, session.id(), assistantMessageId);
             }
-            send(emitter, new StreamEventDto("error", -1, detail));
-            emitter.sender().complete();
+            if (!emitter.live().interrupted()) {
+                send(emitter, new StreamEventDto("error", -1, detail));
+                emitter.sender().complete();
+            }
         } finally {
             activeRuns.remove(session.id(), cancellation);
+            synchronized (activeRuns) {
+                activeRuns.notifyAll();
+            }
         }
     }
 
@@ -980,6 +1114,8 @@ public class ChatService {
         private final List<SseEmitter> watchers = new java.util.concurrent.CopyOnWriteArrayList<>();
         private String activity;
         private boolean ended;
+        private boolean interrupted;
+        private SseEmitter sender;
 
         LiveTurn(String by, String byName, Instant startedAt) {
             this.by = by;
@@ -996,6 +1132,9 @@ public class ChatService {
         }
 
         synchronized void publish(StreamEventDto event) {
+            if (interrupted) {
+                return;
+            }
             if ("text".equals(event.type()) && event.payload() != null) {
                 text.append(event.payload());
             } else if ("tool_use".equals(event.type()) && event.payload() != null) {
@@ -1024,6 +1163,33 @@ public class ChatService {
             watcher.onCompletion(drop);
             watcher.onTimeout(drop);
             watcher.onError(e -> drop.run());
+        }
+
+        /**
+         * The server is going down: the sender and every viewer get one {@code interrupted} event and their streams
+         * close; whatever the turn still sends is dropped.
+         */
+        synchronized void interrupt() {
+            if (interrupted || ended) {
+                return;
+            }
+            interrupted = true;
+            StreamEventDto event = new StreamEventDto(INTERRUPTED, -1, SERVER_RESTART);
+            events.add(event);
+            if (sender != null) {
+                deliver(sender, event);
+                sender.complete();
+            }
+            watchers.forEach(w -> deliver(w, event));
+            end();
+        }
+
+        synchronized boolean interrupted() {
+            return interrupted;
+        }
+
+        synchronized void sender(SseEmitter sender) {
+            this.sender = sender;
         }
 
         synchronized void end() {
@@ -1085,5 +1251,46 @@ public class ChatService {
     @PreDestroy
     void shutdown() {
         executor.shutdownNow();
+    }
+
+    // --- server shutdown: replies in progress end with a clear event, not a dropped connection ---
+
+    @Override
+    public void start() {
+        lifecycleRunning = true;
+    }
+
+    @Override
+    public void stop() {
+        lifecycleRunning = false;
+        shuttingDown = true;
+        int cut = liveTurns.size();
+        liveTurns.values().forEach(LiveTurn::interrupt);
+        activeRuns.values().forEach(Cancellation::cancel);
+        if (cut > 0) {
+            log.info("shutdown: {} reply(ies) in progress interrupted", cut);
+        }
+        long deadline = System.currentTimeMillis() + 5000; // let the turns store what they had
+        synchronized (activeRuns) {
+            while (!activeRuns.isEmpty() && System.currentTimeMillis() < deadline) {
+                try {
+                    activeRuns.wait(200);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+    }
+
+    @Override
+    public boolean isRunning() {
+        return lifecycleRunning;
+    }
+
+    /** First to stop: before tasks wind down and before the web server waits on open requests (these streams). */
+    @Override
+    public int getPhase() {
+        return Integer.MAX_VALUE;
     }
 }

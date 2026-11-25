@@ -22,7 +22,7 @@ function renderStoredMessage(role, content, id, images, sessionId) {
   bubble.hidden = !content && !!(images && images.length); // image-only message: no empty bubble
   msg.appendChild(bubble);
   if (role !== "user" && content) msg.appendChild(copyButton(bubble));
-  if (id) {
+  if (id && role === "user") { // what the model wrote is a record of what it said: not editable
     const edit = document.createElement("button");
     edit.className = "msg__edit";
     edit.title = L("common.edit");
@@ -165,9 +165,19 @@ async function loadAgents(autoOpen) {
   agents = res.data || [];
   renderThreads(agents);
   if (autoOpen && !activeAgentId) {
-    const first = agents.find(a => a.sessionId);
-    if (first) selectAgent(first);
+    const lastId = rememberedAgentId();
+    const open = agents.find(a => a.id === lastId && a.sessionId) || agents.find(a => a.sessionId);
+    if (open) selectAgent(open);
   }
+}
+
+// The agent last opened, so a refresh comes back to it. Keyed by user: several people may share a browser.
+const lastAgentKey = () => "superagent.lastAgent." + (currentUserId || "");
+function rememberedAgentId() {
+  try { return localStorage.getItem(lastAgentKey()); } catch (e) { return null; }
+}
+function rememberAgent(id) {
+  try { localStorage.setItem(lastAgentKey(), id); } catch (e) { /* not remembered */ }
 }
 
 // An agent with collaborators (whoever owns it) is a shared one: listed apart, marked with its head count.
@@ -185,46 +195,88 @@ function renderThreads(list) {
   projectList.forEach(p => {
     const inIt = list.filter(a => a.kind !== "super" && (p.agentIds || []).includes(a.id));
     if (!inIt.length) return;
-    const head = threadGroup(p.name + (p.status === "archived" ? " · " + L("proj.archived") : ""), inIt.length);
+    const key = "p:" + p.id;
+    const head = threadGroup(p.name + (p.status === "archived" ? " · " + L("proj.archived") : ""), inIt.length, key);
     head.classList.add("thread-group--project");
     head.title = L("proj.sidebarHint");
     head.addEventListener("click", () => { setView("projects"); refreshProjects().then(() => openProject(p)); });
     el.threadList.appendChild(head);
-    inIt.forEach(renderThread);
+    inIt.forEach(a => renderThread(a, key));
   });
   // Both groups always show, so it's clear where shared agents will appear even before there are any.
-  el.threadList.appendChild(threadGroup(L("co.myAgents"), mine.length));
-  if (mine.length) mine.forEach(renderThread);
-  else el.threadList.appendChild(threadEmpty(L("co.myEmpty")));
-  el.threadList.appendChild(threadGroup(L("co.sharedAgents"), shared.length));
-  if (shared.length) shared.forEach(renderThread);
-  else el.threadList.appendChild(threadEmpty(L("co.sharedEmpty")));
+  const mineHead = threadGroup(L("co.myAgents"), mine.length, "mine");
+  mineHead.addEventListener("click", () => toggleThreadGroup("mine"));
+  el.threadList.appendChild(mineHead);
+  if (mine.length) mine.forEach(a => renderThread(a, "mine"));
+  else el.threadList.appendChild(threadEmpty(L("co.myEmpty"), "mine"));
+  const sharedHead = threadGroup(L("co.sharedAgents"), shared.length, "shared");
+  sharedHead.addEventListener("click", () => toggleThreadGroup("shared"));
+  el.threadList.appendChild(sharedHead);
+  if (shared.length) shared.forEach(a => renderThread(a, "shared"));
+  else el.threadList.appendChild(threadEmpty(L("co.sharedEmpty"), "shared"));
+  applyThreadFolds();
 }
 
-function threadGroup(label, count) {
+// Folded sidebar groups are a personal preference, remembered on this browser only.
+const THREAD_FOLD_KEY = "superagent.threadGroupsFolded";
+const foldedThreadGroups = new Set((() => { try { return JSON.parse(localStorage.getItem(THREAD_FOLD_KEY) || "[]"); } catch (e) { return []; } })());
+
+function toggleThreadGroup(key) {
+  if (foldedThreadGroups.has(key)) foldedThreadGroups.delete(key); else foldedThreadGroups.add(key);
+  try { localStorage.setItem(THREAD_FOLD_KEY, JSON.stringify([...foldedThreadGroups])); } catch (e) { /* not remembered */ }
+  applyThreadFolds();
+}
+
+// The group holding the open chat always shows, so the current agent is never hidden.
+function applyThreadFolds() {
+  el.threadList.querySelectorAll(".thread-group[data-group]").forEach(head => {
+    const key = head.dataset.group;
+    const rows = [...el.threadList.children].filter(r => r !== head && r.dataset.group === key);
+    const folded = foldedThreadGroups.has(key) && !rows.some(r => r.dataset.id && r.dataset.id === activeAgentId);
+    rows.forEach(r => { r.hidden = folded; });
+    head.classList.toggle("is-folded", folded);
+    const btn = head.querySelector(".thread-group__fold");
+    btn.textContent = folded ? "▸" : "▾";
+    btn.title = L(folded ? "co.groupExpand" : "co.groupCollapse");
+    btn.setAttribute("aria-label", btn.title);
+    btn.setAttribute("aria-expanded", String(!folded));
+  });
+}
+
+function threadGroup(label, count, key) {
   const li = document.createElement("li");
   li.className = "thread-group";
+  li.dataset.group = key;
   const name = document.createElement("span");
   name.textContent = label;
   const n = document.createElement("span");
   n.className = "thread-group__count";
   n.textContent = count;
-  li.append(name, n);
+  const fold = document.createElement("button");
+  fold.type = "button";
+  fold.className = "thread-group__fold";
+  fold.addEventListener("click", e => { e.stopPropagation(); toggleThreadGroup(key); });
+  const end = document.createElement("span");
+  end.className = "thread-group__end";
+  end.append(n, fold);
+  li.append(name, end);
   return li;
 }
 
-function threadEmpty(text) {
+function threadEmpty(text, key) {
   const li = document.createElement("li");
   li.className = "thread-empty";
+  li.dataset.group = key;
   li.textContent = text;
   return li;
 }
 
-function renderThread(a) {
+function renderThread(a, group) {
   {
     const li = document.createElement("li");
     li.className = "thread" + (a.id === activeAgentId ? " is-active" : "");
     li.dataset.id = a.id;
+    li.dataset.group = group;
 
     const avatar = document.createElement("span");
     avatar.className = "agent-avatar";
@@ -234,6 +286,7 @@ function renderThread(a) {
     const name = document.createElement("span");
     name.className = "thread__name";
     name.textContent = a.name || "";
+    name.title = a.name || "";
 
     if (a.managedBy) {
       const tag = document.createElement("span");
@@ -268,10 +321,49 @@ function renderThread(a) {
     del.addEventListener("click", e => { e.stopPropagation(); deleteThread(li, a); });
     if (isOwner(a)) actions.append(rename, del); // collaborators can't edit or delete someone else's agent
 
-    li.append(avatar, name, time, actions);
+    li.append(avatar, name, replyMark(a.id), time, actions);
     li.addEventListener("click", () => selectAgent(a));
+    enableThreadDrag(li);
     el.threadList.appendChild(li);
   }
+}
+
+// Drag a row up or down inside its own group; letting go saves that group's order (per user, on the server).
+let draggedThread = null;
+function clearDropMarks() {
+  el.threadList.querySelectorAll(".thread--drop-before, .thread--drop-after").forEach(r => r.classList.remove("thread--drop-before", "thread--drop-after"));
+}
+function enableThreadDrag(li) {
+  li.draggable = true;
+  li.title = L("co.dragSort");
+  li.addEventListener("dragstart", e => {
+    draggedThread = li;
+    li.classList.add("is-dragging");
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", li.dataset.id);
+  });
+  li.addEventListener("dragover", e => {
+    if (!draggedThread || draggedThread === li || li.dataset.group !== draggedThread.dataset.group) return;
+    e.preventDefault();
+    const after = e.clientY > li.getBoundingClientRect().top + li.offsetHeight / 2;
+    clearDropMarks();
+    li.classList.add(after ? "thread--drop-after" : "thread--drop-before");
+  });
+  li.addEventListener("drop", async e => {
+    if (!draggedThread || draggedThread === li || li.dataset.group !== draggedThread.dataset.group) return;
+    e.preventDefault();
+    const after = li.classList.contains("thread--drop-after");
+    li.parentNode.insertBefore(draggedThread, after ? li.nextSibling : li);
+    const group = li.dataset.group;
+    const ids = [...el.threadList.querySelectorAll(".thread[data-group]")].filter(r => r.dataset.group === group).map(r => r.dataset.id);
+    try { await api.reorderAgents(ids); } catch (err) { /* the reload below shows what the server has */ }
+    loadAgents();
+  });
+  li.addEventListener("dragend", () => {
+    li.classList.remove("is-dragging");
+    clearDropMarks();
+    draggedThread = null;
+  });
 }
 
 // The SuperAgent isn't one more row: it leads the list as an orb with its role under the name.
@@ -289,7 +381,7 @@ function superThread(a) {
   role.className = "super-role";
   role.textContent = L("super.role");
   body.append(name, role);
-  li.append(stage, body);
+  li.append(stage, body, replyMark(a.id));
   li.addEventListener("click", () => selectAgent(a));
   return li;
 }
@@ -373,14 +465,17 @@ async function deleteThread(li, agent) {
 function markActiveThread() {
   el.threadList.querySelectorAll(".thread").forEach(t =>
     t.classList.toggle("is-active", t.dataset.id === activeAgentId));
+  applyThreadFolds();
 }
 
 async function selectAgent(agent) {
   if (activeAgent && agent && activeAgent.id === agent.id && streaming) return; // already here, mid-reply
+  seeReply(agent.id);
   detachStream(); // a reply still coming in carries on on the server; coming back picks it up again
   stopLiveWatch(); // was watching a turn on the previous agent
   activeAgentId = agent.id;
   activeAgent = agent;
+  rememberAgent(agent.id);
   renderAgentPanel(agent);
   markActiveThread();
   setSuperMode(agent.kind === "super");
@@ -553,3 +648,83 @@ function fillModelGroups(select, groups, label) {
 }
 
 // The picker only says that no model can run; it chooses nothing (the admin sets the model).
+
+// ---------- reply marks in the sidebar ----------
+// While an agent is answering, its row spins (blue); a reply that finished while the user was looking elsewhere
+// leaves a green dot until that agent is opened. The server tells which agents are answering; the "finished, not
+// yet seen" ones are kept on this browser so a refresh doesn't lose them.
+let replyingIds = new Set();
+const unseenKey = () => "superagent.unseenReplies." + (currentUserId || "");
+const unseenReplies = new Set();
+let unseenLoadedFor = null;
+
+function loadUnseen() {
+  if (unseenLoadedFor === currentUserId) return;
+  unseenLoadedFor = currentUserId;
+  unseenReplies.clear();
+  try { JSON.parse(localStorage.getItem(unseenKey()) || "[]").forEach(id => unseenReplies.add(id)); } catch (e) { /* none */ }
+}
+function saveUnseen() {
+  try { localStorage.setItem(unseenKey(), JSON.stringify([...unseenReplies])); } catch (e) { /* not remembered */ }
+}
+
+/** The user is looking at this agent's chat right now. */
+function viewingAgent(id) {
+  return id === activeAgentId && !document.hidden && !document.querySelector('[data-pane="chat"]').hidden;
+}
+
+function seeReply(id) {
+  loadUnseen();
+  if (unseenReplies.delete(id)) { saveUnseen(); paintReplyMarks(); }
+}
+
+function replyMark(id) {
+  loadUnseen();
+  const mark = document.createElement("span");
+  mark.className = "thread__reply";
+  mark.dataset.reply = id;
+  setReplyMark(mark, id);
+  return mark;
+}
+
+function setReplyMark(mark, id) {
+  const state = replyingIds.has(id) ? "running" : unseenReplies.has(id) ? "done" : "";
+  mark.className = "thread__reply" + (state ? " is-" + state : "");
+  mark.hidden = !state;
+  mark.title = state === "running" ? L("chat.replyRunning") : state === "done" ? L("chat.replyDone") : "";
+  mark.setAttribute("aria-label", mark.title);
+}
+
+function paintReplyMarks() {
+  el.threadList.querySelectorAll(".thread__reply").forEach(m => setReplyMark(m, m.dataset.reply));
+}
+
+/** Mark an agent as answering at once (a message just sent), without waiting for the next poll. */
+function markReplying(id) {
+  if (!id || replyingIds.has(id)) return;
+  replyingIds = new Set(replyingIds).add(id);
+  paintReplyMarks();
+}
+
+async function refreshReplying() {
+  if (!currentUserId || document.hidden) return;
+  let ids;
+  try { ids = (await fetch("/api/v1/agents/replying").then(r => r.json())).data; } catch (e) { return; }
+  if (!Array.isArray(ids)) return;
+  loadUnseen();
+  const now = new Set(ids);
+  let finished = false;
+  replyingIds.forEach(id => {
+    if (now.has(id)) return;
+    finished = true;
+    if (!viewingAgent(id)) unseenReplies.add(id);
+  });
+  now.forEach(id => unseenReplies.delete(id)); // answering again: the spinner replaces the dot
+  saveUnseen();
+  replyingIds = now;
+  paintReplyMarks();
+  if (finished) loadAgents(); // the finished agents' times move to "now"
+}
+
+setInterval(refreshReplying, 3000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshReplying(); });

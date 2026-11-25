@@ -109,6 +109,26 @@ public class TaskController {
         return ApiResponse.ok(taskService.detail(id, auth.getName()));
     }
 
+    /** One changed file's diff in a coding task (the detail lists the files; each diff is fetched when opened). */
+    @GetMapping(ApiPaths.TASKS + "/{id}/diff")
+    public ApiResponse<String> diff(@PathVariable String id, @org.springframework.web.bind.annotation.RequestParam String path,
+                                    Authentication auth) {
+        return ApiResponse.ok(taskService.harnessDiff(id, auth.getName(), path));
+    }
+
+    @GetMapping(ApiPaths.TASKS + "/{id}/subtitle")
+    public ApiResponse<com.superagent.api.task.SubtitleDto> subtitle(@PathVariable String id, Authentication auth) {
+        return ApiResponse.ok(taskService.subtitle(id, auth.getName()));
+    }
+
+    /** The owner fixes one disputed span of a subtitle task: {@code {"text": "…"}}. */
+    @PutMapping(ApiPaths.TASKS + "/{id}/subtitle/disputes/{spanId}")
+    public ApiResponse<com.superagent.api.task.SubtitleDto> fixSubtitle(@PathVariable String id, @PathVariable String spanId,
+                                                                    @RequestBody java.util.Map<String, String> body,
+                                                                    Authentication auth) {
+        return ApiResponse.ok(taskService.fixSubtitle(id, auth.getName(), spanId, body.get("text")));
+    }
+
     @GetMapping(ApiPaths.TASKS + "/{id}/events")
     public ApiResponse<List<TaskEventDto>> events(@PathVariable String id,
                                                   @RequestParam(defaultValue = "0") int offset, Authentication auth) {
@@ -149,6 +169,12 @@ public class TaskController {
     public ApiResponse<Void> stop(@PathVariable String id, Authentication auth) {
         taskService.stop(id, auth.getName());
         return ApiResponse.empty();
+    }
+
+    /** "Don't wait, run it": a task waiting for others starts on the scheduler's next pass. */
+    @PostMapping(ApiPaths.TASKS + "/{id}/run-now")
+    public ApiResponse<TaskDto> runNow(@PathVariable String id, Authentication auth) {
+        return ApiResponse.ok(taskService.runNow(id, auth.getName()));
     }
 
     @DeleteMapping(ApiPaths.TASKS + "/{id}")

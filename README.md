@@ -77,7 +77,7 @@ The thinking behind SuperAgent, in `docs/prd/` (HTML; open them in a browser):
 
 Every release on the [Releases page](https://github.com/oryx-labs/SuperAgent/releases) has a tarball (`superagent-<version>.tar.gz`, with its `.sha256`) and a Docker image.
 
-**Docker** (the image has Java 21, Node.js 24 and the agent CLIs preinstalled: Claude Code, Codex, Gemini CLI, Qwen Code, Kimi Code and DeepSeek Harness):
+**Docker** (the image has Java 21, Node.js 24, ffmpeg and the agent CLIs preinstalled: Claude Code, Codex, Gemini CLI, Qwen Code, Kimi Code and DeepSeek Harness):
 
 ```bash
 cp docker/.env.example docker/.env      # set the admin and MySQL passwords
@@ -94,6 +94,7 @@ This starts SuperAgent with MySQL on `http://<host>:18080`. The image is `ghcr.i
 
 - Java 21+ and Maven (to build); Java 21+ on the server (to run)
 - MySQL 8 (the default storage; tables are created on first start)
+- [ffmpeg](https://ffmpeg.org/) on the server's `PATH`, for subtitles and transcription: it converts and cuts audio, so files of any size and format can be transcribed. Without it a file must be under 24 MB and in a format the transcription API takes. Install it with the system's package manager (`brew install ffmpeg`, `apt-get install ffmpeg`, …) or from the **Models** page.
 - The agent CLIs on the server's `PATH`: [Claude Code](https://www.npmjs.com/package/@anthropic-ai/claude-code) and/or [Codex](https://www.npmjs.com/package/@openai/codex). These can also be installed later from the **Models** page.
 
 ### Package
@@ -120,6 +121,10 @@ superagent-<version>/
 - `config/superagent.env`: secrets and deployment values, sourced by the start script. It includes the MySQL connection, `SERVER_PORT` and `JAVA_OPTS`. Outside systems (the GitHub OAuth app, the Feishu app) are set up by an administrator under **Admin → System Settings → Integrations**, not in this file. Every entry ships commented out. Keep the file at mode `600`.
 - `config/application.yml`: overrides the defaults built into the jar. Changes take effect on restart, with no repackaging.
 
+To allow companies without a Codex API key to use the server user's existing Codex CLI login, set
+`superagent.provider.codex.use-cli-login: true` in `config/application.yml` (default: `false`). A company's
+configured key takes priority. When enabled, companies without their own key share the server's CLI account.
+
 At minimum, set these before the first start:
 
 ```bash
@@ -140,7 +145,7 @@ bin/superagent-stop.sh           # stop
 ```
 
 - **Start:** checks for Java 21+, then reports success only once `/actuator/health` responds. If the server is already running, it refuses to start a second copy. If startup fails, it prints the end of the log.
-- **force:** stops the running process with SIGTERM. The server shuts down gracefully; if it is still running after 35 seconds (`STOP_TIMEOUT`), it is killed. The server then starts again.
+- **force:** stops the running process with SIGTERM. The server shuts down gracefully; if it is still running after 180 seconds (`STOP_TIMEOUT`; running tasks get up to 2 minutes to finish their turn), it is killed. The server then starts again.
 - **Working directory:** the scripts can be run from any directory. Relative paths in the config, such as `./data`, resolve against the install directory.
 
 Once started, open `http://<host>:18080` and choose **Register an organization**: you get its admin account (the password is shown once, and you set your own at first sign-in). Every organization is independent and equal: its own data, its own model keys (add them on the Models page), and any organization's admin can install the agent CLIs.
@@ -149,10 +154,12 @@ Once started, open `http://<host>:18080` and choose **Register an organization**
 
 ```bash
 mvn clean install                                  # build and test all modules
-mvn -pl superagent-server spring-boot:run          # run locally on :18080
+scripts/run-local.sh                               # build (mvn package) and run locally on :18080
 ```
 
-Under `spring-boot:run`, the UI is served straight from `superagent-ui/src/main/resources/static`, so front-end edits show up on a browser refresh with no rebuild or restart. Back-end (Java) changes still need `mvn install` and a restart.
+`scripts/run-local.sh` copies the executable jar into `run/` and runs that copy, so building or `mvn install` while the server runs doesn't affect it. Arguments go to the server (e.g. `--server.port=18099`); `SKIP_BUILD=1` runs the last build. The UI is served straight from `superagent-ui/src/main/resources/static`, so front-end edits show up on a browser refresh; back-end (Java) changes need the script run again.
+
+Restarting doesn't lose task work: on shutdown the server stops starting new task runs, waits up to `superagent.task.shutdown.timeout` (default 2 minutes) for running turns and local merges to finish, then marks the rest as interrupted by the restart and ends their CLI processes. After the next start they resume right away, without counting as a retry. A chat reply cut short by the restart ends with a notice to send it again.
 
 ### Releasing
 

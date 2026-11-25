@@ -249,7 +249,7 @@ public class FileFolderService {
         }
     }
 
-    private static String cleanName(String name) {
+    static String cleanName(String name) {
         String clean = name == null ? "" : name.strip();
         if (clean.isEmpty()) {
             throw new IllegalArgumentException("目录名不能为空");
@@ -261,5 +261,18 @@ public class FileFolderService {
             throw new IllegalArgumentException("目录名最多 " + MAX_NAME + " 个字符");
         }
         return clean;
+    }
+
+    /** Employee handover: move the person's folder tree and placements to the successor. */
+    public int transferOwnership(String fromUserId, String toUserId) {
+        if (fromUserId == null || toUserId == null || fromUserId.equals(toUserId)) {
+            return 0;
+        }
+        List<FileFolder> folders = store.list(fromUserId);
+        for (FileFolder f : folders) {
+            store.save(f.withOwner(toUserId));
+        }
+        store.transferPlacements(fromUserId, toUserId);
+        return folders.size();
     }
 }

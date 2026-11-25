@@ -17,6 +17,7 @@ Object.assign(api, {
   nodeRuntime: () => fetch("/api/v1/providers/node").then(r => r.json()),
   checkLatest: id => fetch("/api/v1/providers/" + id + "/check-latest", { method: "POST" }).then(r => r.json()),
   credentials: id => fetch("/api/v1/providers/" + id + "/credentials").then(kbJson),
+  importCredentials: id => fetch("/api/v1/providers/" + id + "/credentials/import", { method: "POST" }).then(kbJson),
   saveCredential: (id, cid, body) => fetch("/api/v1/providers/" + id + "/credentials" + (cid ? "/" + cid : ""), {
     method: cid ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   }).then(kbJson),
@@ -28,6 +29,9 @@ Object.assign(api, {
   installNode: () => fetch("/api/v1/providers/node/install", { method: "POST" }).then(r => r.json()),
   installLog: id => fetch("/api/v1/providers/" + id + "/install-log").then(kbJson),
   nodeInstallLog: () => fetch("/api/v1/providers/node/install-log").then(kbJson),
+  ffmpeg: () => fetch("/api/v1/providers/ffmpeg").then(r => r.json()),
+  installFfmpeg: () => fetch("/api/v1/providers/ffmpeg/install", { method: "POST" }).then(r => r.json()),
+  ffmpegInstallLog: () => fetch("/api/v1/providers/ffmpeg/install-log").then(kbJson),
 });
 
 const mel = {
@@ -95,6 +99,7 @@ async function loadModels() {
   mel.empty.hidden = list.length > 0;
   list.forEach(p => mel.rows.appendChild(modelRow(p)));
   renderNodeRuntime(list);
+  renderFfmpeg();
 }
 
 // ---------- Node.js runtime (what the npm-based CLIs install and run on) ----------
@@ -142,6 +147,41 @@ async function renderNodeRuntime(providers) {
 }
 
 nel.logBtn.addEventListener("click", () => openInstallLog("Node.js", api.nodeInstallLog));
+
+// ---------- ffmpeg (subtitles and transcription convert and cut audio with it) ----------
+const fel = {
+  state: document.getElementById("ffmpegState"),
+  hint: document.getElementById("ffmpegHint"),
+  btn: document.getElementById("ffmpegInstallBtn"),
+  logBtn: document.getElementById("ffmpegLogBtn"),
+};
+
+async function renderFfmpeg() {
+  let f;
+  try { const res = await api.ffmpeg(); f = res && res.data; } catch (e) { return; }
+  if (!f) return;
+  fel.state.className = "status-badge node-card__state " + (f.installing ? "is-model-installing"
+    : f.installed ? "is-model-ok" : "is-model-no_auth");
+  fel.state.textContent = f.installing ? L("ffmpeg.installing")
+    : !f.installed ? L("ffmpeg.missing")
+    : (f.version || L("ffmpeg.installed"));
+  fel.hint.textContent = f.installing && f.step ? f.step
+    : f.error ? L("ffmpeg.failed", { msg: f.error })
+    : f.installed ? L("ffmpeg.okHint", { path: f.path || "" })
+    : L("ffmpeg.missingHint");
+  fel.hint.classList.toggle("is-error", !!f.error && !f.installed);
+  fel.btn.hidden = f.installed || f.installing;
+  fel.btn.disabled = f.installing;
+  fel.logBtn.hidden = !f.hasLog;
+}
+
+fel.logBtn.addEventListener("click", () => openInstallLog("ffmpeg", api.ffmpegInstallLog));
+fel.btn.addEventListener("click", async () => {
+  fel.btn.disabled = true;
+  try { await api.installFfmpeg(); } catch (e) { showToast(e.message, true); }
+  renderFfmpeg();
+  openInstallLog("ffmpeg", api.ffmpegInstallLog);
+});
 
 // ---------- install / upgrade log ----------
 const iel = {
@@ -530,6 +570,7 @@ const cel2 = {
   panel: document.getElementById("modelKeysPanel"),
   rows: document.getElementById("credRows"),
   add: document.getElementById("credAddBtn"),
+  importBtn: document.getElementById("credImportBtn"),
   form: document.getElementById("credForm"),
   label: document.getElementById("credLabel"),
   url: document.getElementById("credUrl"),
@@ -697,6 +738,40 @@ function closeCredentialForm() {
 
 cel2.add.addEventListener("click", () => openCredentialForm(null));
 cel2.cancel.addEventListener("click", closeCredentialForm);
+
+// Import the keys this server already has — the CLI's own config (where a switcher like cc-switch keeps them) and
+// the environment. Keys already in the pool are left alone, so pressing it twice changes nothing.
+cel2.importBtn.addEventListener("click", async () => {
+  const id = modelDetailId;
+  if (!id) return;
+  cel2.importBtn.disabled = true;
+  try {
+    const res = await api.importCredentials(id);
+    const imported = (res && res.data && res.data.imported) || 0;
+    const found = (res && res.data && res.data.found) || 0;
+    const kept = (res && res.data && res.data.kept) || 0;
+    const deleted = (res && res.data && res.data.deleted) || 0;
+    const sources = (res && res.data && res.data.sources) || [];
+    // What it found, and what happened to it: new, already in the pool, or deleted earlier (not added back).
+    showToast(imported ? L("cred.imported", { n: imported })
+      : deleted ? L("cred.importDeleted", { n: found, d: deleted })
+      : kept ? L("cred.importAllKnown", { n: kept })
+      : sources.length ? L("cred.importNoneWhere", { where: sources.join("、") })
+      : L("cred.importNone"), !imported && !kept && !deleted);
+    // Check what came in, so the row says right away whether it works.
+    const fresh = (res && res.data && res.data.credentials) || [];
+    for (const c of fresh) {
+      if (!c.env && c.source === "machine" && c.status === "unknown") {
+        await api.checkCredential(id, c.id);
+      }
+    }
+    if (modelDetailId === id) await loadCredentials();
+  } catch (err) {
+    showToast(L("cred.importFailed", { reason: err.message }), true);
+  } finally {
+    cel2.importBtn.disabled = false;
+  }
+});
 cel2.form.addEventListener("submit", async e => {
   e.preventDefault();
   const body = { label: cel2.label.value.trim(), baseUrl: cel2.url.value.trim(), apiKey: cel2.key.value.trim(),

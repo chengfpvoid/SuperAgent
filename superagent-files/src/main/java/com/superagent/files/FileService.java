@@ -198,6 +198,19 @@ public class FileService {
         return store.listFor(owner, List.of());
     }
 
+    /** Employee handover: rewrite {@code owner} on every live file owned by {@code fromUserId}. */
+    public int transferOwnership(String fromUserId, String toUserId) {
+        if (fromUserId == null || toUserId == null || fromUserId.equals(toUserId)) {
+            return 0;
+        }
+        int n = 0;
+        for (WorkFile f : ownedBy(fromUserId)) {
+            store.save(f.withOwner(toUserId));
+            n++;
+        }
+        return n;
+    }
+
     String excerpt(WorkFile f) {
         if (WorkFile.LINK.equals(f.storage())) {
             return f.location(); // the address says what it's about
@@ -636,21 +649,6 @@ public class FileService {
         } catch (IOException | RuntimeException e) {
             return null; // a file that can't be read now just isn't excerpted
         }
-    }
-
-    /**
-     * Keeps a long text someone pasted into a chat as a Markdown file of the agent's, so it outlives the session and
-     * tasks and later sessions can read it whole. Named after its first line.
-     */
-    public WorkFile keepPasted(String user, String agentId, String sessionId, String messageId, String text) {
-        String first = text.strip().lines().map(String::strip).filter(l -> !l.isEmpty()).findFirst().orElse("对话中的长文");
-        first = first.replaceAll("^[#>*\\-\\s]+", "").replaceAll("[\\\\/:*?\"<>|]", " ").strip();
-        if (first.length() > 40) {
-            first = first.substring(0, 40);
-        }
-        WorkFile saved = writeText(new Origin(user, agentId, null, sessionId, messageId, WorkFile.ORIGIN_CHAT),
-                cleanName((first.isBlank() ? "对话中的长文" : first) + ".md"), text, null, List.of());
-        return saved;
     }
 
     /** Copies a file the user can see into a run's workspace ({@code uploads/}), for it to work on; returns the relative path. */

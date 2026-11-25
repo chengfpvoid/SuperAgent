@@ -46,7 +46,7 @@ public class ProviderInferenceProbe {
     private static final int CLI_TIMEOUT_SECONDS = 90;
 
     private final ProviderProbe probe;
-    private final ObjectMapper mapper = new ObjectMapper();
+    private static final ObjectMapper mapper = new ObjectMapper();
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 
     /** Who background checks are booked to in the usage records. */
@@ -86,7 +86,7 @@ public class ProviderInferenceProbe {
      */
     public void checkKey(String providerKey, String modelId, RunCredential credential) throws IOException, InterruptedException {
         if ("codebuddy".equals(providerKey) || "gemini".equals(providerKey) || "minimax".equals(providerKey)) {
-            // No fixed OpenAI /models URL: CLI version (and optional short headless turn) is the key check.
+            // No fixed OpenAI /models URL: a short headless turn is the key check (version alone is not auth).
             check(providerKey, modelId, credential, SOURCE_KEY_CHECK);
             return;
         }
@@ -102,7 +102,7 @@ public class ProviderInferenceProbe {
                 return;
             }
             if (resp.statusCode() == 401 || resp.statusCode() == 403) {
-                throw new IOException(cause(resp.statusCode()) + "（HTTP " + resp.statusCode() + errorDetail(resp.body()) + "）");
+                throw new IOException(cause(resp.statusCode(), resp.body()) + "（HTTP " + resp.statusCode() + errorDetail(resp.body()) + "）");
             }
             // No model list there (some relays): fall through to one tiny inference.
         }
@@ -113,7 +113,7 @@ public class ProviderInferenceProbe {
     }
 
     private static final java.util.Set<String> VENDORS = java.util.Set.of("deepseek", "glm", "kimi", "qwen", "grok",
-            "codebuddy", "gemini", "minimax");
+            "codebuddy", "gemini", "minimax", "qoder");
 
     private SystemSettingStore settings; // null in tests: CodeBuddy region defaults to internal
 
@@ -140,6 +140,7 @@ public class ProviderInferenceProbe {
             case "codebuddy" -> checkCodeBuddy(modelId, credential);
             case "gemini" -> checkGemini(modelId, credential);
             case "minimax" -> checkMinimax(modelId, credential);
+            case "qoder" -> checkQoder(modelId, credential);
             case "deepseek", "glm", "kimi", "qwen", "grok" -> checkVendor(providerKey, modelId, credential);
             default -> throw new IOException("Inference check is not available for " + providerKey + " yet");
         };
@@ -147,8 +148,8 @@ public class ProviderInferenceProbe {
     }
 
     /**
-     * CodeBuddy: (A) key present + {@code codebuddy --version}; (B) when {@code modelId} is set, one short
-     * {@code -p} turn. No OpenAI {@code /models} on a fixed base URL.
+     * CodeBuddy: one short {@code -p} turn that exercises the key. {@code --version} alone is not auth —
+     * without a model the caller must leave health as UNKNOWN.
      */
     private com.superagent.core.usage.TokenUsage checkCodeBuddy(String modelId, RunCredential credential)
             throws IOException, InterruptedException {
@@ -156,6 +157,9 @@ public class ProviderInferenceProbe {
             throw new IOException("还没有配置 API Key");
         }
         Path bin = probe.findBinary("codebuddy").orElseThrow(() -> new IOException("codebuddy is not installed"));
+        if (modelId == null || modelId.isBlank()) {
+            throw new IOException("还没有可用来测试的模型（等模型列表刷新后再检查）");
+        }
         String region = settings == null ? "internal"
                 : settings.all().getOrDefault("codebuddy.internet-environment", "internal");
         if (region == null || region.isBlank()) {
@@ -169,45 +173,27 @@ public class ProviderInferenceProbe {
         if (!"public".equalsIgnoreCase(region.strip())) {
             env.put("CODEBUDDY_INTERNET_ENVIRONMENT", region.strip().toLowerCase(java.util.Locale.ROOT));
         }
-        run(List.of(bin.toString(), "--version"), null, env);
-        if (modelId == null) {
-            return null;
-        }
         String out = run(List.of(bin.toString(), "-p", "-y", "--output-format", "json", "--max-turns", "1",
                 "--model", modelId, "--", PROMPT), null, env);
-        try {
-            JsonNode root = mapper.readTree(out);
-            // stream-json may print several lines; prefer the last object that looks like a result
-            if (!root.isObject()) {
-                JsonNode last = null;
-                for (String line : out.split("\\R")) {
-                    if (line.strip().startsWith("{")) {
-                        last = mapper.readTree(line);
-                    }
-                }
-                root = last == null ? root : last;
-            }
-            if (root.path("is_error").asBoolean(false)) {
-                throw new IOException(tail(root.path("result").asText("codebuddy reported an error")));
-            }
-            JsonNode u = root.path("usage");
-            if (u.isObject()) {
-                return new com.superagent.core.usage.TokenUsage(modelId, u.path("input_tokens").asLong(0),
-                        u.path("cache_read_input_tokens").asLong(0), u.path("cache_creation_input_tokens").asLong(0),
-                        0, u.path("output_tokens").asLong(0), 0, null);
-            }
-        } catch (IOException e) {
-            if (e.getMessage() != null && e.getMessage().contains("codebuddy reported")) {
-                throw e;
-            }
-            // non-JSON success still counts: the process exited 0
+        JsonNode root = parseCliJsonObject(out, "codebuddy");
+        if (root.path("is_error").asBoolean(false)) {
+            throw new IOException(tail(root.path("result").asText("codebuddy reported an error")));
+        }
+        if (!"result".equals(root.path("type").asText(""))) {
+            throw new IOException("codebuddy returned no usable result");
+        }
+        JsonNode u = root.path("usage");
+        if (u.isObject()) {
+            return new com.superagent.core.usage.TokenUsage(modelId, u.path("input_tokens").asLong(0),
+                    u.path("cache_read_input_tokens").asLong(0), u.path("cache_creation_input_tokens").asLong(0),
+                    0, u.path("output_tokens").asLong(0), 0, null);
         }
         return new com.superagent.core.usage.TokenUsage(modelId, 0, 0, 0, 0, 0, 0, null);
     }
 
     /**
-     * Gemini CLI: key + {@code gemini --version}; when {@code modelId} is set, one short {@code -p} turn with an
-     * isolated {@code GEMINI_CONFIG_DIR} so the operator home is untouched.
+     * Gemini CLI: one short {@code -p} turn under an isolated {@code GEMINI_CLI_HOME}. Version alone is not
+     * auth; without a model the caller must leave health as UNKNOWN.
      */
     private com.superagent.core.usage.TokenUsage checkGemini(String modelId, RunCredential credential)
             throws IOException, InterruptedException {
@@ -215,48 +201,53 @@ public class ProviderInferenceProbe {
             throw new IOException("还没有配置 API Key");
         }
         Path bin = probe.findBinary("gemini").orElseThrow(() -> new IOException("gemini is not installed"));
+        if (modelId == null || modelId.isBlank()) {
+            throw new IOException("还没有可用来测试的模型（等模型列表刷新后再检查）");
+        }
         java.util.Map<String, String> env = new java.util.HashMap<>();
         env.put("GEMINI_API_KEY", credential.apiKey());
         if (credential.baseUrl() != null && !credential.baseUrl().isBlank()) {
             env.put("GOOGLE_GEMINI_BASE_URL", credential.baseUrl().strip());
         }
-        run(List.of(bin.toString(), "--version"), null, env);
-        if (modelId == null) {
-            return null;
-        }
-        Path config = Files.createTempDirectory("sa-gemini-probe-");
+        Path home = Files.createTempDirectory("sa-gemini-probe-");
         try {
-            env.put("GEMINI_CONFIG_DIR", config.toString());
-            env.put("HOME", config.toString());
-            Files.writeString(config.resolve("settings.json"), "{\"mcpServers\":{}}");
-            List<String> argv = new java.util.ArrayList<>(List.of(bin.toString(), "-p", PROMPT,
-                    "--output-format", "json", "--approval-mode", "plan", "--skip-trust", "--model", modelId));
-            String out = run(argv, null, env);
-            try {
-                JsonNode root = mapper.readTree(out.strip().isEmpty() ? "{}" : lastJsonObject(out));
-                if (root.path("error").isObject()) {
-                    throw new IOException(tail(root.path("error").path("message").asText("gemini reported an error")));
-                }
-                JsonNode stats = root.path("stats");
-                if (stats.isObject()) {
-                    long in = stats.path("inputTokens").asLong(stats.path("promptTokenCount").asLong(0));
-                    long output = stats.path("outputTokens").asLong(stats.path("candidatesTokenCount").asLong(0));
-                    return new com.superagent.core.usage.TokenUsage(modelId, in, 0, 0, 0, output, 0, null);
-                }
-            } catch (IOException e) {
-                if (e.getMessage() != null && e.getMessage().contains("gemini reported")) {
-                    throw e;
-                }
+            Files.createDirectories(home.resolve(".gemini"));
+            Files.writeString(home.resolve(".gemini").resolve("settings.json"), "{\"mcpServers\":{}}");
+            env.put("GEMINI_CLI_HOME", home.toString());
+            env.put("HOME", home.toString());
+            // stream-json: same stats fields as the runner parser (not the non-stream metrics blob).
+            String out = run(List.of(bin.toString(), "-p", PROMPT, "--output-format", "stream-json",
+                    "--approval-mode", "plan", "--skip-trust", "--model", modelId), null, env);
+            JsonNode root = lastStreamEvent(out, "gemini");
+            if ("error".equals(root.path("type").asText(""))
+                    || (root.path("error").isObject() && !"result".equals(root.path("type").asText("")))) {
+                throw new IOException(tail(root.path("error").path("message")
+                        .asText(root.path("message").asText("gemini reported an error"))));
+            }
+            if ("result".equals(root.path("type").asText("")) && "error".equals(root.path("status").asText(""))) {
+                throw new IOException(tail(root.path("error").path("message").asText("gemini reported an error")));
+            }
+            if (!"result".equals(root.path("type").asText("")) || !"success".equals(root.path("status").asText(""))) {
+                throw new IOException("gemini returned no usable result");
+            }
+            JsonNode stats = root.path("stats");
+            if (stats.isObject()) {
+                long totalIn = stats.path("input_tokens").asLong(0);
+                long cached = stats.path("cached").asLong(0);
+                long output = stats.path("output_tokens").asLong(0);
+                long explicit = stats.path("input").asLong(0);
+                long in = explicit > 0 ? explicit : Math.max(0, totalIn - cached);
+                return new com.superagent.core.usage.TokenUsage(modelId, in, cached, 0, 0, output, 0, null);
             }
             return new com.superagent.core.usage.TokenUsage(modelId, 0, 0, 0, 0, 0, 0, null);
         } finally {
-            deleteTree(config);
+            deleteTree(home);
         }
     }
 
     /**
-     * MiniMax Code: key + {@code mcode --version}; when {@code modelId} is set, one short {@code mcode exec}
-     * under an isolated {@code MINIMAX_DATA_DIR} with the key written into config.yaml.
+     * MiniMax Code: one short {@code mcode exec} under an isolated {@code MINIMAX_DATA_DIR}. Version alone
+     * is not auth; without a model the caller must leave health as UNKNOWN.
      */
     private com.superagent.core.usage.TokenUsage checkMinimax(String modelId, RunCredential credential)
             throws IOException, InterruptedException {
@@ -264,9 +255,8 @@ public class ProviderInferenceProbe {
             throw new IOException("还没有配置 API Key");
         }
         Path bin = probe.findBinary("mcode").orElseThrow(() -> new IOException("mcode is not installed"));
-        run(List.of(bin.toString(), "--version"), null, java.util.Map.of());
-        if (modelId == null) {
-            return null;
+        if (modelId == null || modelId.isBlank()) {
+            throw new IOException("还没有可用来测试的模型（等模型列表刷新后再检查）");
         }
         Path data = Files.createTempDirectory("sa-mcode-probe-");
         try {
@@ -284,12 +274,19 @@ public class ProviderInferenceProbe {
             String out = run(List.of(bin.toString(), "exec", "--output-format", "stream-json",
                     "--permission", "off", "--max-steps", "1", "--model", model, PROMPT), null, env);
             long in = 0, cached = 0, outTokens = 0;
+            boolean completed = false;
             for (String line : out.split("\\R")) {
                 if (!line.strip().startsWith("{")) {
                     continue;
                 }
-                JsonNode e = mapper.readTree(line);
+                JsonNode e;
+                try {
+                    e = mapper.readTree(line);
+                } catch (IOException parseErr) {
+                    throw new IOException("mcode returned unreadable output", parseErr);
+                }
                 if ("exec.completed".equals(e.path("type").asText())) {
+                    completed = true;
                     JsonNode u = e.path("result").path("usage");
                     in += u.path("input_tokens").asLong(u.path("inputTokens").asLong(0));
                     cached += u.path("cached_input_tokens").asLong(0);
@@ -302,11 +299,75 @@ public class ProviderInferenceProbe {
                     throw new IOException(tail(e.path("error").path("message").asText("mcode turn failed")));
                 }
             }
+            if (!completed) {
+                throw new IOException("mcode returned no usable result");
+            }
             return new com.superagent.core.usage.TokenUsage(modelId, Math.max(0, in - cached), cached, 0, 0, outTokens,
                     0, null);
         } finally {
             deleteTree(data);
         }
+    }
+
+    /** Parses a CLI dump into one JSON object; prefers the last object line / trailing object. */
+    private JsonNode parseCliJsonObject(String out, String cli) throws IOException {
+        if (out == null || out.isBlank()) {
+            throw new IOException(cli + " returned empty output");
+        }
+        try {
+            JsonNode root = mapper.readTree(out);
+            if (root.isObject()) {
+                return root;
+            }
+        } catch (IOException ignored) {
+            // fall through to last-object scan
+        }
+        JsonNode last = null;
+        for (String line : out.split("\\R")) {
+            String t = line.strip();
+            if (!t.startsWith("{")) {
+                continue;
+            }
+            try {
+                last = mapper.readTree(t);
+            } catch (IOException ignored) {
+                // keep scanning
+            }
+        }
+        if (last == null || !last.isObject()) {
+            try {
+                last = mapper.readTree(lastJsonObject(out));
+            } catch (IOException e) {
+                throw new IOException(cli + " returned unreadable output", e);
+            }
+        }
+        if (last == null || !last.isObject()) {
+            throw new IOException(cli + " returned unreadable output");
+        }
+        return last;
+    }
+
+    /** Last JSONL event from a stream-json dump (must be an object). */
+    private JsonNode lastStreamEvent(String out, String cli) throws IOException {
+        if (out == null || out.isBlank()) {
+            throw new IOException(cli + " returned empty output");
+        }
+        JsonNode last = null;
+        for (String line : out.split("\\R")) {
+            String t = line.strip();
+            if (!t.startsWith("{")) {
+                continue;
+            }
+            try {
+                last = mapper.readTree(t);
+            } catch (IOException ignored) {
+                // keep scanning
+            }
+        }
+        if (last == null || !last.isObject()) {
+            throw new IOException(cli + " returned unreadable output");
+        }
+        return last;
     }
 
     /** Last JSON object in a multi-line CLI dump (Gemini {@code -o json} may print banners first). */
@@ -327,8 +388,52 @@ public class ProviderInferenceProbe {
         return last;
     }
 
-    // --- claude ---
+    /**
+     * Qoder CN: the personal access token is the key. {@code --list-models} proves it — the CLI exits non-zero when
+     * it is not authenticated — and costs no quota; a model check is one short {@code -p} turn.
+     */
+    private com.superagent.core.usage.TokenUsage checkQoder(String modelId, RunCredential credential)
+            throws IOException, InterruptedException {
+        if (credential == null) {
+            throw new IOException("还没有配置 API Key");
+        }
+        Path bin = probe.findBinary("qoderclicn").orElseThrow(() -> new IOException("qoderclicn is not installed"));
+        java.util.Map<String, String> env = ProviderModelFetcher.qoderEnv(credential);
+        run(List.of(bin.toString(), "--list-models"), null, env);   // the token: a non-zero exit means it is not accepted
+        if (modelId == null) {
+            return null;
+        }
+        String out = run(List.of(bin.toString(), "-p", "--output-format", "json", "--model", modelId, PROMPT), null, env);
+        try {
+            JsonNode root = mapper.readTree(out);
+            if (!root.isObject()) {
+                JsonNode last = null;
+                for (String line : out.split("\\R")) {
+                    if (line.strip().startsWith("{")) {
+                        last = mapper.readTree(line);
+                    }
+                }
+                root = last == null ? root : last;
+            }
+            if (root.path("is_error").asBoolean(false)) {
+                throw new IOException(tail(root.path("result").asText("qoder reported an error")));
+            }
+            JsonNode u = root.path("usage");
+            if (u.isObject()) {
+                return new com.superagent.core.usage.TokenUsage(modelId, u.path("input_tokens").asLong(0),
+                        u.path("cache_read_input_tokens").asLong(0), u.path("cache_creation_input_tokens").asLong(0),
+                        0, u.path("output_tokens").asLong(0), 0, null);
+            }
+        } catch (IOException e) {
+            if (e.getMessage() != null && e.getMessage().contains("qoder reported")) {
+                throw e;
+            }
+            // non-JSON success still counts: the process exited 0
+        }
+        return new com.superagent.core.usage.TokenUsage(modelId, 0, 0, 0, 0, 0, 0, null);
+    }
 
+    // --- claude ---
     private com.superagent.core.usage.TokenUsage checkClaude(String modelId, RunCredential credential) throws IOException, InterruptedException {
         java.util.Optional<ApiAccess> access = ApiAccess.anthropic(credential);
         if (access.isEmpty()) {
@@ -355,7 +460,7 @@ public class ProviderInferenceProbe {
             body.put("model", modelId);
             body.put("max_tokens", 8);
             body.putArray("messages").addObject().put("role", "user").put("content", PROMPT);
-            HttpResponse<String> resp = send(access.base(), access.authorizeBearer(HttpRequest.newBuilder(URI.create(access.base() + "/chat/completions"))
+            HttpResponse<String> resp = sendInference(access.base(), access.authorizeBearer(HttpRequest.newBuilder(URI.create(access.base() + "/chat/completions"))
                     .timeout(Duration.ofSeconds(60)).header("content-type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))));
             JsonNode u = mapper.readTree(resp.body()).path("usage");
@@ -379,7 +484,7 @@ public class ProviderInferenceProbe {
                 .header("content-type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)));
         access.authorize(req);
-        HttpResponse<String> resp = send(base, req);
+        HttpResponse<String> resp = sendInference(base, req);
         JsonNode root = mapper.readTree(resp.body());
         if (!root.path("content").isArray()) {
             throw new IOException("response has no content");
@@ -393,7 +498,39 @@ public class ProviderInferenceProbe {
     private HttpResponse<String> send(String base, HttpRequest.Builder req) throws IOException, InterruptedException {
         HttpResponse<String> resp = sendRaw(base, req);
         if (resp.statusCode() != 200) {
-            throw new IOException(cause(resp.statusCode()) + "（HTTP " + resp.statusCode() + errorDetail(resp.body()) + "）");
+            throw new IOException(cause(resp.statusCode(), resp.body()) + "（HTTP " + resp.statusCode() + errorDetail(resp.body()) + "）");
+        }
+        return resp;
+    }
+
+    /**
+     * The endpoint says the model itself is gone (retired, renamed, or never existed there) — not the key.
+     * The caller may try another model instead of failing the key over one dead name.
+     */
+    public static class ModelGoneException extends IOException {
+        public ModelGoneException(String message) {
+            super(message);
+        }
+    }
+
+    /** Whether a failed inference says the model is gone rather than the key being wrong. */
+    static boolean modelGone(int status, String body) {
+        String raw = body == null ? "" : body.toLowerCase(java.util.Locale.ROOT);
+        String m = (errorMessage(body) + " " + raw).toLowerCase(java.util.Locale.ROOT);
+        return m.contains("model not exist") || m.contains("no longer available") || m.contains("model_not_found")
+                || m.contains("model not found") || m.contains("invalid model") || m.contains("unknown model")
+                || (status == 404 && m.contains("model"));
+    }
+
+    /** One inference: a model that is gone says so, so the caller can try another one. */
+    private HttpResponse<String> sendInference(String base, HttpRequest.Builder req) throws IOException, InterruptedException {
+        HttpResponse<String> resp = sendRaw(base, req);
+        if (resp.statusCode() != 200) {
+            String reason = cause(resp.statusCode(), resp.body()) + "（HTTP " + resp.statusCode() + errorDetail(resp.body()) + "）";
+            if (modelGone(resp.statusCode(), resp.body())) {
+                throw new ModelGoneException(reason);
+            }
+            throw new IOException(reason);
         }
         return resp;
     }
@@ -446,7 +583,7 @@ public class ProviderInferenceProbe {
             body.put("model", modelId);
             body.put("input", PROMPT);
             body.put("max_output_tokens", 16);
-            HttpResponse<String> resp = send(access.base(), access.authorizeBearer(HttpRequest.newBuilder(URI.create(access.base() + "/responses"))
+            HttpResponse<String> resp = sendInference(access.base(), access.authorizeBearer(HttpRequest.newBuilder(URI.create(access.base() + "/responses"))
                     .timeout(Duration.ofSeconds(60)).header("content-type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))));
             JsonNode u = mapper.readTree(resp.body()).path("usage");
@@ -458,7 +595,7 @@ public class ProviderInferenceProbe {
         // Read-only sandbox, prompt on stdin: the probe can't touch anything even if the model tried.
         List<String> argv = new java.util.ArrayList<>(List.of(codex.toString(), "exec", "--json", "--skip-git-repo-check",
                 "-s", "read-only", "-m", modelId, "-"));
-        String out = run(argv, PROMPT, java.util.Map.of());
+        String out = run(argv, PROMPT, java.util.Map.of(), true);
         long in = 0, cached = 0, outTokens = 0, reasoning = 0;
         for (String line : out.split("\\R")) {
             if (line.contains("turn.completed")) {
@@ -481,11 +618,20 @@ public class ProviderInferenceProbe {
     /** Runs argv (no shell) in a scratch dir; non-zero exit or timeout is a failed check. */
     private String run(List<String> argv, String stdin, java.util.Map<String, String> extraEnv)
             throws IOException, InterruptedException {
+        return run(argv, stdin, extraEnv, false);
+    }
+
+    private String run(List<String> argv, String stdin, java.util.Map<String, String> extraEnv, boolean codexLogin)
+            throws IOException, InterruptedException {
         Path dir = Files.createTempDirectory("sa-infer-");
         try {
             ProcessBuilder pb = new ProcessBuilder(argv).directory(dir.toFile()).redirectErrorStream(true);
             pb.environment().put("PATH", String.join(File.pathSeparator, probe.searchPath()));
             pb.environment().putAll(extraEnv);
+            if (codexLogin) {
+                pb.environment().remove("CODEX_API_KEY");
+                pb.environment().remove("OPENAI_API_KEY");
+            }
             Process p = pb.start();
             try (OutputStream in = p.getOutputStream()) {
                 if (stdin != null) {
@@ -571,7 +717,6 @@ public class ProviderInferenceProbe {
         }
     }
 
-    /** The API's own error message when the body is an Anthropic-style error, else a short raw tail. */
     /** What an HTTP failure most likely means, in words an administrator can act on. */
     static String cause(int status) {
         return switch (status) {
@@ -584,15 +729,42 @@ public class ProviderInferenceProbe {
         };
     }
 
-    private String errorDetail(String body) {
+    /**
+     * A 403 on an inference can mean the key authenticated but the account may not run the one model probed
+     * (DashScope's "Access to model denied") — a different problem with a different fix than a restricted key.
+     */
+    static String cause(int status, String body) {
+        if (status == 403 && modelDenied(body)) {
+            return "Key 已通过验证，但账号无权使用测试的模型（请在服务商控制台开通该模型，或换模型检查）";
+        }
+        return cause(status);
+    }
+
+    private static boolean modelDenied(String body) {
+        String m = errorMessage(body).toLowerCase(java.util.Locale.ROOT);
+        return m.contains("model")
+                && (m.contains("denied") || m.contains("eligible") || m.contains("access") || m.contains("permission") || m.contains("not allowed"));
+    }
+
+    /** The API's own error message: Anthropic/OpenAI wrap it in {@code error}, DashScope-style bodies carry it at the top level. */
+    static String errorDetail(String body) {
+        if (blank(body)) {
+            return "";
+        }
+        String msg = errorMessage(body);
+        return ": " + (msg.isBlank() ? tail(body) : tail(msg));
+    }
+
+    private static String errorMessage(String body) {
         if (blank(body)) {
             return "";
         }
         try {
-            String msg = mapper.readTree(body).path("error").path("message").asText("");
-            return ": " + (msg.isBlank() ? tail(body) : tail(msg));
+            JsonNode root = mapper.readTree(body);
+            String msg = root.path("error").path("message").asText("");
+            return msg.isBlank() ? root.path("message").asText("") : msg;
         } catch (IOException e) {
-            return ": " + tail(body);
+            return "";
         }
     }
 

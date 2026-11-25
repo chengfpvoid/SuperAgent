@@ -69,6 +69,7 @@ public class ClaudeCliAgentRunner implements AgentRunner {
 
     /** Conversations' CLIs kept running between turns; null = every turn starts its own. */
     private ClaudeWarmSessions warm;
+    private final ClaudeUsageLedger ledger = new ClaudeUsageLedger();
 
     public ClaudeCliAgentRunner(
             @Value("${superagent.agent.claude.command:claude}") String command,
@@ -134,6 +135,8 @@ public class ClaudeCliAgentRunner implements AgentRunner {
         applyCredential(pb, request.credential());
         // No update check, telemetry or error reporting on each run: measured 4.7s → 3.2s to the CLI's first event.
         pb.environment().put("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+        // Some platform tools take minutes (transcribing an hour of audio).
+        pb.environment().put("MCP_TOOL_TIMEOUT", String.valueOf(com.superagent.runtime.mcp.McpGrants.TOOL_TIMEOUT_SECONDS * 1000L));
     }
 
     static void applyCredential(ProcessBuilder pb, com.superagent.core.chat.RunCredential credential) {
@@ -205,7 +208,7 @@ public class ClaudeCliAgentRunner implements AgentRunner {
 
         Process process;
         try {
-            process = pb.start();
+            process = CliProcesses.track(pb.start());
             if (stdinMessage != null) {
                 try (OutputStream stdin = process.getOutputStream()) {
                     stdin.write(stdinMessage.getBytes(StandardCharsets.UTF_8));
@@ -219,7 +222,7 @@ public class ClaudeCliAgentRunner implements AgentRunner {
         }
 
         // Let the orchestrator stop this turn by killing the subprocess.
-        cancellation.onCancel(process::destroyForcibly);
+        cancellation.onCancel(() -> CliProcesses.kill(process)); // with its children: a tool it started must not live on
 
         Thread stderr = new Thread(() -> drainStderr(process.getErrorStream(), request.sessionId(), stderrTail),
                 "claude-stderr-" + request.sessionId());
@@ -227,6 +230,7 @@ public class ClaudeCliAgentRunner implements AgentRunner {
         stderr.start();
 
         ClaudeStreamParser parser = new ClaudeStreamParser(); // per run: it tracks this run's token usage
+        String conversation = null;
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
             String line;
@@ -250,12 +254,11 @@ public class ClaudeCliAgentRunner implements AgentRunner {
                 }
                 sink.emit(new AgentEvent(request.sessionId(), null, seq.getAndIncrement(), e.type(), e.payload(), Instant.now()));
                 concluded |= e.type() == AgentEventType.RESULT || e.type() == AgentEventType.ERROR;
-                if (e.costUsd() != null) {
-                    sink.emit(new AgentEvent(request.sessionId(), null, seq.getAndIncrement(),
-                            AgentEventType.USAGE, String.valueOf(e.costUsd()), Instant.now()));
+                if (e.type() == AgentEventType.SYSTEM) {
+                    conversation = e.payload();
                 }
-                if (!e.tokens().isEmpty()) {
-                    Tokens.emit(sink, request.sessionId(), seq.getAndIncrement(), withModel(e.tokens(), request.model()));
+                if (e.usage() != null) {
+                    emitUsage(request, sink, seq, e.usage());
                 }
             }
             if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
@@ -290,10 +293,31 @@ public class ClaudeCliAgentRunner implements AgentRunner {
         } finally {
             deleteQuietly(mcpConfigFile);
             deleteQuietly(settingsFile);
-            // Stopped, timed out or crashed before its result: what the calls so far used is still billed.
-            Tokens.emit(sink, request.sessionId(), seq.getAndIncrement(), withModel(parser.unreportedTokens(), request.model()));
+            emitUnreported(request, sink, seq, parser, conversation);
         }
         return conversationMissing ? Retry.NEW_CONVERSATION : Retry.NONE;
+    }
+
+    /** The turn's tokens and cost from its result: this turn's share only, not the conversation's running totals. */
+    void emitUsage(AgentRunRequest request, AgentEventSink sink, AtomicLong seq, ClaudeStreamParser.ResultUsage usage) {
+        ClaudeUsageLedger.Turn turn = ledger.settle(usage, request.isFirstTurn());
+        if (turn.costUsd() != null) {
+            sink.emit(new AgentEvent(request.sessionId(), null, seq.getAndIncrement(),
+                    AgentEventType.USAGE, String.valueOf(turn.costUsd()), Instant.now()));
+        }
+        Tokens.emit(sink, request.sessionId(), seq.getAndIncrement(),
+                Tokens.withContext(withModel(turn.tokens(), request.model()), usage.contextTokens()));
+    }
+
+    /** Stopped, timed out or crashed before its result: what the calls so far used is still billed. */
+    void emitUnreported(AgentRunRequest request, AgentEventSink sink, AtomicLong seq, ClaudeStreamParser parser,
+                        String conversation) {
+        List<com.superagent.core.usage.TokenUsage> used = parser.unreportedTokens();
+        if (!used.isEmpty()) {
+            ledger.forget(conversation);
+            Tokens.emit(sink, request.sessionId(), seq.getAndIncrement(),
+                    Tokens.withContext(withModel(used, request.model()), parser.contextTokens()));
+        }
     }
 
     /** Usage the CLI didn't name a model for runs on the one requested (or, with none, the CLI's own default). */

@@ -30,7 +30,82 @@ public record SystemSettingsDto(String agentDefaultModel, String companyName, St
                                 Boolean taskFixedModelsOn,
                                 /** The models tasks are held to while that's on (null on a save keeps them). */
                                 java.util.List<String> taskFixedModels,
-                                String codebuddyInternetEnvironment) {
+                                /**
+                                 * Directories on this server a coding task may work in as a local project (a repository
+                                 * anywhere under one); none means only remote repositories. Null on a save keeps them.
+                                 */
+                                java.util.List<String> codeRoots,
+                                /**
+                                 * A coding task's review loop (review → acceptance → fix → verify again): how many
+                                 * rounds before it stops for the user (null on a save keeps it).
+                                 */
+                                Integer codingReviewMaxRounds,
+                                /** …and how much (USD) the task may have spent before it stops (null on a save keeps it). */
+                                Double codingReviewMaxSpend,
+                                /** A subtitle task: the most text models that correct its disputed spans (null on a save keeps it). */
+                                Integer subtitleMaxCalibrators,
+                                String codebuddyInternetEnvironment,
+                                /** A chat session moves to a new one once its last turn read this many tokens (null on a save keeps it). */
+                                Integer chatSessionMaxTokens,
+                                /** …or once it has had this many turns (null on a save keeps it). */
+                                Integer chatSessionMaxTurns,
+                                /** Document standard in every system prompt and file check (null on a save keeps it; default on). */
+                                Boolean docStyleOn,
+                                /** The skill (id or name) the standard is made from; blank = 去 AI 味写作规范 (null on a save keeps it). */
+                                String docStyleSkill) {
+
+    public SystemSettingsDto(String agentDefaultModel, String companyName, String companyShortName, String publicUrl,
+                             java.util.List<String> backupModels, Integer complexMaxSubtasks, Integer complexMaxParallel,
+                             Boolean taskFixedModelsOn, java.util.List<String> taskFixedModels, java.util.List<String> codeRoots,
+                             Integer codingReviewMaxRounds, Double codingReviewMaxSpend, Integer subtitleMaxCalibrators,
+                             String codebuddyInternetEnvironment, Integer chatSessionMaxTokens, Integer chatSessionMaxTurns) {
+        this(agentDefaultModel, companyName, companyShortName, publicUrl, backupModels, complexMaxSubtasks,
+                complexMaxParallel, taskFixedModelsOn, taskFixedModels, codeRoots, codingReviewMaxRounds,
+                codingReviewMaxSpend, subtitleMaxCalibrators, codebuddyInternetEnvironment, chatSessionMaxTokens,
+                chatSessionMaxTurns, null, null);
+    }
+
+    public SystemSettingsDto(String agentDefaultModel, String companyName, String companyShortName, String publicUrl,
+                             java.util.List<String> backupModels, Integer complexMaxSubtasks, Integer complexMaxParallel,
+                             Boolean taskFixedModelsOn, java.util.List<String> taskFixedModels, java.util.List<String> codeRoots,
+                             Integer codingReviewMaxRounds, Double codingReviewMaxSpend, Integer subtitleMaxCalibrators,
+                             String codebuddyInternetEnvironment) {
+        this(agentDefaultModel, companyName, companyShortName, publicUrl, backupModels, complexMaxSubtasks,
+                complexMaxParallel, taskFixedModelsOn, taskFixedModels, codeRoots, codingReviewMaxRounds,
+                codingReviewMaxSpend, subtitleMaxCalibrators, codebuddyInternetEnvironment, null, null);
+    }
+
+    public SystemSettingsDto(String agentDefaultModel, String companyName, String companyShortName, String publicUrl,
+                             java.util.List<String> backupModels, Integer complexMaxSubtasks, Integer complexMaxParallel,
+                             Boolean taskFixedModelsOn, java.util.List<String> taskFixedModels, java.util.List<String> codeRoots,
+                             Integer codingReviewMaxRounds, Double codingReviewMaxSpend, Integer subtitleMaxCalibrators) {
+        this(agentDefaultModel, companyName, companyShortName, publicUrl, backupModels, complexMaxSubtasks,
+                complexMaxParallel, taskFixedModelsOn, taskFixedModels, codeRoots, codingReviewMaxRounds,
+                codingReviewMaxSpend, subtitleMaxCalibrators, null, null, null);
+    }
+
+    public SystemSettingsDto(String agentDefaultModel, String companyName, String companyShortName, String publicUrl,
+                             java.util.List<String> backupModels, Integer complexMaxSubtasks, Integer complexMaxParallel,
+                             Boolean taskFixedModelsOn, java.util.List<String> taskFixedModels, java.util.List<String> codeRoots,
+                             Integer codingReviewMaxRounds, Double codingReviewMaxSpend) {
+        this(agentDefaultModel, companyName, companyShortName, publicUrl, backupModels, complexMaxSubtasks,
+                complexMaxParallel, taskFixedModelsOn, taskFixedModels, codeRoots, codingReviewMaxRounds,
+                codingReviewMaxSpend, null);
+    }
+
+    public SystemSettingsDto(String agentDefaultModel, String companyName, String companyShortName, String publicUrl,
+                             java.util.List<String> backupModels, Integer complexMaxSubtasks, Integer complexMaxParallel,
+                             Boolean taskFixedModelsOn, java.util.List<String> taskFixedModels, java.util.List<String> codeRoots) {
+        this(agentDefaultModel, companyName, companyShortName, publicUrl, backupModels, complexMaxSubtasks,
+                complexMaxParallel, taskFixedModelsOn, taskFixedModels, codeRoots, null, null);
+    }
+
+    public SystemSettingsDto(String agentDefaultModel, String companyName, String companyShortName, String publicUrl,
+                             java.util.List<String> backupModels, Integer complexMaxSubtasks, Integer complexMaxParallel,
+                             Boolean taskFixedModelsOn, java.util.List<String> taskFixedModels) {
+        this(agentDefaultModel, companyName, companyShortName, publicUrl, backupModels, complexMaxSubtasks,
+                complexMaxParallel, taskFixedModelsOn, taskFixedModels, null);
+    }
 
     public SystemSettingsDto(String agentDefaultModel, String companyName, String companyShortName) {
         this(agentDefaultModel, companyName, companyShortName, null, null);
@@ -42,19 +117,6 @@ public record SystemSettingsDto(String agentDefaultModel, String companyName, St
 
     public SystemSettingsDto(String agentDefaultModel, String companyName, String companyShortName, String publicUrl,
                              java.util.List<String> backupModels) {
-        this(agentDefaultModel, companyName, companyShortName, publicUrl, backupModels, null, null, null, null, null);
-    }
-
-    public SystemSettingsDto(String agentDefaultModel, String companyName, String companyShortName, String publicUrl,
-                             java.util.List<String> backupModels, Integer complexMaxSubtasks, Integer complexMaxParallel) {
-        this(agentDefaultModel, companyName, companyShortName, publicUrl, backupModels, complexMaxSubtasks,
-                complexMaxParallel, null, null, null);
-    }
-
-    public SystemSettingsDto(String agentDefaultModel, String companyName, String companyShortName, String publicUrl,
-                             java.util.List<String> backupModels, Integer complexMaxSubtasks, Integer complexMaxParallel,
-                             Boolean taskFixedModelsOn, java.util.List<String> taskFixedModels) {
-        this(agentDefaultModel, companyName, companyShortName, publicUrl, backupModels, complexMaxSubtasks,
-                complexMaxParallel, taskFixedModelsOn, taskFixedModels, null);
+        this(agentDefaultModel, companyName, companyShortName, publicUrl, backupModels, null, null, null, null);
     }
 }

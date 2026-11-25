@@ -23,6 +23,7 @@ async function sendMessage(text, images, imageUrls, fileIds, fileNames) {
   const me = { abort: new AbortController(), detached: false };
   sending = me;
   setStreaming(true);
+  markReplying(activeAgentId);
   try {
     const resp = await fetch("/api/v1/sessions/" + activeSessionId + "/messages", {
       method: "POST",
@@ -53,6 +54,7 @@ async function sendMessage(text, images, imageUrls, fileIds, fileNames) {
     if (sending === me) sending = null;
     handles.text.classList.remove("is-streaming");
     setStreaming(false);
+    if (handles.interrupted) return; // keep the notice: the server going down has nothing newer to show
     await selectSession(activeSessionId); // refresh with ids so messages become editable
     loadAgents();
     if (activeAgent) renderAgentWork(activeAgent); // a turn may have set off a task
@@ -125,6 +127,16 @@ function handleFrame(frame, handles) {
       handles.text.after(stoppedNote(!handles.text.textContent.trim()));
       break;
     }
+    case "interrupted": {
+      // The server is restarting: the reply stops here and the page shouldn't reload from it.
+      handles.interrupted = true;
+      handles.text.classList.remove("is-streaming");
+      const note = document.createElement("div");
+      note.className = "is-error";
+      note.textContent = L("chat.interrupted");
+      handles.text.after(note);
+      break;
+    }
     case "error":
       handles.text.classList.add("is-error");
       handles.text.textContent = L("chat.errored", { msg: ev.payload || L("chat.errGeneric") });
@@ -167,9 +179,15 @@ function setStreaming(on) {
   streaming = on;
   el.input.disabled = on;
   chatImages.setDisabled(on);
+  setSendButtonStop(on);
+}
+
+/** The send button doubles as Stop while a reply is coming in: one we sent, or a running turn we re-attached to. */
+function setSendButtonStop(on) {
   el.sendBtn.classList.toggle("is-stop", on);
   el.sendBtn.textContent = on ? "■" : "↑";
   el.sendBtn.title = on ? L("msg.stop") : L("msg.send");
+  el.sendBtn.disabled = on ? false : noChatModel;
 }
 
 function relativeTime(iso) {
@@ -191,7 +209,26 @@ function autoGrow() {
 // When the latest reply asks whether to create a task, or ends a task's parameter table with "下一步：回复「…」",
 // a button sends that answer, so the user needn't type it. Only on the last message, and gone once anything is sent.
 const QUICK_CREATE = /要创建吗[？?]/;
-const QUICK_NEXT = /下一步[：:]\s*回复\s*[「“"]([^」”"\n]{1,80})[」”"]/;
+const QUICK_CONFIRM = /确认创建吗[？?]/; // an agent proposing a new agent
+const QUICK_CONFIRM_EDIT = /确认修改吗[？?]/; // an agent proposing to edit an agent
+const QUICK_NEXT = /下一步[：:]\s*回复\s*([^\n]+)/;
+
+/** The answers a "下一步：回复「A」或「B」" line offers, at most three. */
+function nextReplies(text) {
+  const line = QUICK_NEXT.exec(text || "");
+  if (!line) return [];
+  return [...line[1].matchAll(/[「“"]([^」”"\n]{1,80})[」”"]/g)].map(m => m[1].trim()).filter(Boolean).slice(0, 3);
+}
+
+function quickReplyButton(reply, onClick) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "quick-reply";
+  btn.textContent = reply;
+  btn.title = L("chat.quickReplyHint");
+  btn.addEventListener("click", onClick);
+  return btn;
+}
 
 function attachQuickReplies() {
   el.messages.querySelectorAll(".quick-replies").forEach(x => x.remove());
@@ -200,22 +237,18 @@ function attachQuickReplies() {
   if (!last || !last.classList.contains("msg--agent") || last.classList.contains("msg--background") || streaming) return;
   const bubble = last.querySelector(".bubble");
   const text = (bubble && (bubble.dataset.md || bubble.textContent)) || "";
-  const next = QUICK_NEXT.exec(text);
-  const reply = next ? next[1].trim() : QUICK_CREATE.test(text) ? L("chat.quickCreate") : null;
-  if (!reply) return;
+  const next = nextReplies(text);
+  const replies = next.length ? next : QUICK_CONFIRM_EDIT.test(text) ? [L("chat.quickConfirmEdit")]
+    : QUICK_CONFIRM.test(text) ? [L("chat.quickConfirm")]
+    : QUICK_CREATE.test(text) ? [L("chat.quickCreate")] : [];
+  if (!replies.length) return;
   const row = document.createElement("div");
   row.className = "quick-replies";
-  const btn = document.createElement("button");
-  btn.type = "button";
-  btn.className = "quick-reply";
-  btn.textContent = reply;
-  btn.title = L("chat.quickReplyHint");
-  btn.addEventListener("click", () => {
+  replies.forEach(reply => row.appendChild(quickReplyButton(reply, () => {
     if (streaming) return;
     row.remove();
     el.input.value = reply;
     el.composer.requestSubmit();
-  });
-  row.appendChild(btn);
+  })));
   last.appendChild(row);
 }

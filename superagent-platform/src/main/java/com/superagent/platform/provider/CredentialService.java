@@ -48,10 +48,12 @@ public class CredentialService {
             .map(com.superagent.core.provider.ProviderCatalog.Entry::key).collect(java.util.stream.Collectors.toSet());
     public static final String ENV_ID = "env";
 
-    private static final Set<String> VENDOR_CHECKED = Set.of("deepseek", "glm", "kimi", "qwen", "grok", "codebuddy",
-            "gemini", "minimax");
+    // Vendors with a fixed /models URL can validate the key alone. CodeBuddy / Gemini / MiniMax need a
+    // real headless turn (version alone is not auth) — without a model they stay UNKNOWN, not OK.
+    // Qoder proves the token with its own model list, so it needs no model either.
+    private static final Set<String> VENDOR_CHECKED = Set.of("deepseek", "glm", "kimi", "qwen", "grok", "qoder");
     private static final Set<String> CHECKED = Set.of("claude", "codex", "deepseek", "glm", "kimi", "qwen", "grok",
-            "codebuddy", "gemini", "minimax");
+            "codebuddy", "gemini", "minimax", "qoder");
 
     private static final Logger log = LoggerFactory.getLogger(CredentialService.class);
     private static final TypeReference<List<ProviderModelDto>> MODEL_LIST = new TypeReference<>() {
@@ -62,6 +64,8 @@ public class CredentialService {
     private final SecretCipher cipher;
     private final ProviderInferenceProbe probe;
     private final MachineCredentials machine; // null in tests: nothing to import
+    @org.springframework.beans.factory.annotation.Value("${superagent.provider.codex.use-cli-login:false}")
+    private boolean codexCliLogin;
     private final ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
     private final ExecutorService checker = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "credential-check");
@@ -88,16 +92,35 @@ public class CredentialService {
     }
 
     /**
+     * What an import saw on the machine: {@code found} keys, of which {@code added} were new to the pool,
+     * {@code kept} were already in it and {@code deleted} an admin deleted earlier (those keep their hash, so
+     * they are not added again). {@code sources} says where a key would have been found.
+     */
+    public record MachineImport(int found, int added, int kept, int deleted, java.util.List<String> sources) {
+    }
+
+    /**
      * Adds the machine's keys not in the pool yet — never one an admin deleted (deleted entries keep their hash).
      * Into an empty pool they go first, so runs keep using what they used before; otherwise last.
      */
-    public int importMachine(String providerKey) {
+    public MachineImport importMachine(String providerKey) {
         backfillHashes(providerKey);
         java.util.Set<String> known = store.knownKeyHashes(providerKey);
+        java.util.Set<String> inPool = store.list(providerKey).stream().map(ProviderCredential::keyHash)
+                .filter(java.util.Objects::nonNull).collect(java.util.stream.Collectors.toSet());
+        int found = 0;
         int added = 0;
+        int kept = 0;
+        int deleted = 0;
         for (MachineCredentials.Found f : machine == null ? List.<MachineCredentials.Found>of() : machine.find(providerKey)) {
+            found++;
             String hash = ProviderCredential.hash(f.apiKey());
             if (!known.add(hash)) {
+                if (inPool.contains(hash)) {
+                    kept++;
+                } else {
+                    deleted++;   // found on the machine, but an admin deleted it: not added again
+                }
                 continue;
             }
             int next = store.list(providerKey).stream().mapToInt(ProviderCredential::priority).max().orElse(0) + 1;
@@ -112,7 +135,8 @@ public class CredentialService {
             store.list(providerKey).stream().filter(c -> ProviderCredential.MACHINE.equals(c.source()))
                     .forEach(c -> checkSoon(c.id()));
         }
-        return added;
+        log.info("{}: machine import found {} key(s), added {}, kept {}, deleted before", providerKey, found, added, kept, deleted);
+        return new MachineImport(found, added, kept, deleted, machine == null ? List.of() : machine.sources(providerKey));
     }
 
     /** Entries saved before hashes existed get one, so their key is recognised when found again on the machine. */
@@ -153,7 +177,12 @@ public class CredentialService {
         if (used.credential() != null) {
             store.find(used.id()).ifPresent(c -> store.save(c.withHealth(ProviderCredential.ERROR, tail(error))));
         }
-        Choice next = choose(providerKey, used.id());
+        Choice next;
+        try {
+            next = choose(providerKey, used.id());
+        } catch (NoCompanyKeyException e) {
+            return Optional.empty();
+        }
         if (next.id().equals(used.id())) {
             return Optional.empty();
         }
@@ -165,6 +194,14 @@ public class CredentialService {
     /** Whether this company has a key of its own for this CLI (an enabled pool entry); never throws. */
     public boolean hasOwnKey(String providerKey) {
         return POOLED.contains(providerKey) && store.list(providerKey).stream().anyMatch(ProviderCredential::enabled);
+    }
+
+    boolean allowsCliLogin(String providerKey) {
+        return codexCliLogin && "codex".equals(providerKey);
+    }
+
+    boolean canChoose(String providerKey) {
+        return hasOwnKey(providerKey) || allowsCliLogin(providerKey);
     }
 
     private Choice choose(String providerKey, String excluding) {
@@ -180,6 +217,9 @@ public class CredentialService {
         // Every company runs on its own keys only: never on the machine's environment or CLI logins, which are no
         // company's (each will have a runtime of its own; for now they share one machine).
         if (pool.isEmpty()) {
+            if (allowsCliLogin(providerKey) && !hasOwnKey(providerKey) && !ENV_ID.equals(excluding)) {
+                return new Choice(null);
+            }
             throw new NoCompanyKeyException(providerKey);
         }
         return new Choice(toRun(pool.get(0)));
@@ -236,36 +276,86 @@ public class CredentialService {
      * model the CLI is known to run.
      */
     ProviderCredential check(ProviderCredential c) {
-        String model = testModel(c.providerKey());
+        Instant startedAt = Instant.now();
+        List<String> candidates = testModels(c.providerKey());
         ProviderCredential checked;
         // Vendors and Codex list models with the key alone; Claude needs a model to ask.
         boolean keyAlone = VENDOR_CHECKED.contains(c.providerKey()) || "codex".equals(c.providerKey());
-        if (!CHECKED.contains(c.providerKey()) || (model == null && !keyAlone)) {
+        if (!CHECKED.contains(c.providerKey()) || (candidates.isEmpty() && !keyAlone)) {
             checked = c.withHealth(ProviderCredential.UNKNOWN, CHECKED.contains(c.providerKey())
-                    ? "还没有可用来测试的模型（等模型列表刷新后再检查）" : "这个 CLI 暂不支持检查 Key");
+                    ? "还没有可用来测试的模型（端点没有模型列表，请点「刷新」，或让 CLI 配置一个模型）"
+                    : "这个 CLI 暂不支持检查 Key");
         } else {
-            try {
-                probe.checkKey(c.providerKey(), model, toRun(c));
-                checked = c.withHealth(ProviderCredential.OK, null);
-            } catch (IOException e) {
-                checked = c.withHealth(ProviderCredential.ERROR, tail(e.getMessage() == null ? e.toString() : e.getMessage()));
-            } catch (InterruptedException e) {
+            IOException failure = null;
+            boolean interrupted = false;
+            // A vendor needs no model: its key proves itself against the endpoint's model list.
+            List<String> tries = candidates.isEmpty() ? java.util.List.of((String) null) : candidates;
+            for (String model : tries) {
+                try {
+                    probe.checkKey(c.providerKey(), model, toRun(c));
+                    failure = null;
+                    break;
+                } catch (ProviderInferenceProbe.ModelGoneException gone) {
+                    failure = gone;      // this model is gone there; the next one may still work
+                } catch (IOException e) {
+                    failure = e;         // another kind of problem: report it as it is
+                    break;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                    break;
+                } catch (IllegalStateException e) { // key can't be decrypted (secret key changed)
+                    failure = new IOException("密钥无法解密，请重新填写 API Key");
+                    break;
+                }
+            }
+            if (interrupted) {
                 Thread.currentThread().interrupt();
                 return c;
-            } catch (IllegalStateException e) { // key can't be decrypted (secret key changed)
-                checked = c.withHealth(ProviderCredential.ERROR, "密钥无法解密，请重新填写 API Key");
             }
+            checked = failure == null ? c.withHealth(ProviderCredential.OK, null)
+                    : c.withHealth(ProviderCredential.ERROR, tail(failure.getMessage() == null ? failure.toString() : failure.getMessage()));
+        }
+        return saveUnlessNewerVerdict(c.id(), startedAt, checked);
+    }
+
+    /**
+     * Saves a check's verdict unless a newer one landed while this check was probing — a live run's failover or
+     * an admin's manual check is fresher evidence than a probe that started before it. Also keeps a key deleted
+     * mid-check deleted (a blind save would resurrect its row).
+     */
+    private ProviderCredential saveUnlessNewerVerdict(String id, Instant startedAt, ProviderCredential checked) {
+        ProviderCredential now = store.find(id).orElse(null);
+        if (now == null) {
+            return checked;
+        }
+        if (now.checkedAt() != null && now.checkedAt().isAfter(startedAt)) {
+            return now;
         }
         store.save(checked);
         return checked;
     }
 
-    /** The model a health check asks: one the last model sweep saw answer, else the first listed. */
-    private String testModel(String providerKey) {
+    /** How many models a health check may try before giving up. */
+    private static final int MAX_TEST_MODELS = 5;
+
+    /**
+     * The models a health check asks, best first: one the last sweep saw answer, then the others. A model the
+     * endpoint has retired is skipped (the check moves on to the next one), and with no list at all the model
+     * Claude Code is configured to run is used — that one works by definition.
+     */
+    private List<String> testModels(String providerKey) {
         List<ProviderModelDto> models = providers.findByKey(providerKey).map(ModelProvider::modelsJson)
                 .map(this::parse).orElse(List.of());
-        return models.stream().filter(ProviderModelDto::canInfer).map(ProviderModelDto::id).findFirst()
-                .orElse(models.isEmpty() ? null : models.get(0).id());
+        List<String> ordered = new java.util.ArrayList<>();
+        models.stream().filter(ProviderModelDto::canInfer).map(ProviderModelDto::id).forEach(ordered::add);
+        models.stream().map(ProviderModelDto::id).filter(id -> !ordered.contains(id)).forEach(ordered::add);
+        if (ordered.isEmpty() && "claude".equals(providerKey) && machine != null) {
+            String cliModel = machine.claudeModel();
+            if (cliModel != null) {
+                ordered.add(cliModel);
+            }
+        }
+        return ordered.size() > MAX_TEST_MODELS ? ordered.subList(0, MAX_TEST_MODELS) : ordered;
     }
 
     private void checkSoon(String id) {

@@ -61,14 +61,28 @@ public class CodeBuddyCliAgentRunner extends JsonLineCliRunner {
         } else if (request.systemPromptWithMemory() != null && !request.systemPromptWithMemory().isBlank()) {
             cmd.addAll(List.of("--append-system-prompt", request.systemPromptWithMemory()));
         }
-        // Headless print mode needs an explicit permission policy or the CLI blocks tool use.
+        // Headless print mode needs an explicit permission policy or the CLI blocks / waits on tools.
+        // -y / bypassPermissions only when skipPermissions=true. An empty allowlist (FileTagger,
+        // AgentMemoryService, …) must deny tools — never fall through to -y. --tools "" disables
+        // built-ins; --setting-sources "" avoids user/project settings re-enabling bypass.
         if (request.skipPermissions()) {
             cmd.add("-y");
         } else if (request.allowedTools() != null && !request.allowedTools().isEmpty()) {
+            // --allowedTools takes full permission rules (incl. Bash(git:*)); --tools takes bare
+            // built-in names only. MCP rules stay on --allowedTools / --mcp-config, not --tools.
             cmd.add("--allowedTools");
             cmd.add(String.join(" ", request.allowedTools()));
+            cmd.add("--tools");
+            cmd.add(builtInToolNames(request.allowedTools()));
+            cmd.add("--setting-sources");
+            cmd.add("");
         } else {
-            cmd.add("-y");
+            cmd.add("--tools");
+            cmd.add("");
+            cmd.add("--permission-mode");
+            cmd.add("dontAsk");
+            cmd.add("--setting-sources");
+            cmd.add("");
         }
         String mcp = mcpConfig(request);
         if (mcp != null) {
@@ -89,6 +103,33 @@ public class CodeBuddyCliAgentRunner extends JsonLineCliRunner {
             return null;
         }
         return request.mcpConfig();
+    }
+
+    /**
+     * Built-in names for CodeBuddy {@code --tools}: strip scoped permission args
+     * ({@code Bash(git:*)} → {@code Bash}), drop MCP rules ({@code mcp__…}), preserve order, dedupe.
+     * Empty when the allowlist has no built-ins (MCP-only) — still disables every built-in tool.
+     */
+    static String builtInToolNames(List<String> allowedTools) {
+        if (allowedTools == null || allowedTools.isEmpty()) {
+            return "";
+        }
+        java.util.LinkedHashSet<String> names = new java.util.LinkedHashSet<>();
+        for (String rule : allowedTools) {
+            if (rule == null || rule.isBlank()) {
+                continue;
+            }
+            String r = rule.strip();
+            // Strip scoped args first so paths like Read(./src/__tests__/**) are not mistaken for MCP.
+            int paren = r.indexOf('(');
+            String name = (paren >= 0 ? r.substring(0, paren) : r).strip();
+            if (name.isBlank() || name.startsWith("mcp__") || name.contains("__")) {
+                // MCP rules (mcp__server / server__tool) stay off --tools; built-in names only.
+                continue;
+            }
+            names.add(name);
+        }
+        return String.join(",", names);
     }
 
     @Override

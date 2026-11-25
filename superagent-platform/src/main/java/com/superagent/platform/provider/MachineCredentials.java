@@ -78,6 +78,47 @@ public class MachineCredentials {
         };
     }
 
+    /**
+    /**
+     * Where a key for this provider would be found — the places {@link #find} looks, whether or not anything is
+     * there. Shown when nothing was found, so it says what to look at instead of only that there is nothing.
+     */
+    public List<String> sources(String providerKey) {
+        return switch (providerKey) {
+            case "claude" -> List.of("服务器环境变量 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN",
+                    "~/.claude/settings.json");
+            case "codex" -> List.of("服务器环境变量 CODEX_API_KEY / OPENAI_API_KEY", "~/.codex/auth.json");
+            default -> {
+                var access = com.superagent.core.provider.ProviderCatalog.find(providerKey).map(e -> e.access()).orElse(null);
+                yield access == null || access.keyEnv() == null ? List.of()
+                        : List.of("服务器环境变量 " + access.keyEnv());
+            }
+        };
+    }
+
+    /**
+     * The model Claude Code is configured to run — its environment first, else the CLI's own settings (where a
+     * switcher like cc-switch keeps it). Null when neither names one.
+     */
+    public String claudeModel() {
+        String model = blankToNull(env.apply("ANTHROPIC_MODEL"));
+        if (model == null) {
+            JsonNode settings = readJson(claudeDir.resolve("settings.json"));
+            if (settings != null) {
+                model = blankToNull(settings.path("env").path("ANTHROPIC_MODEL").asText(null));
+            }
+        }
+        return model == null ? null : stripContextWindow(model);
+    }
+
+    /**
+     * Claude Code writes a context-window hint into the model name ("MiniMax-M3[1m]"). The API only knows the
+     * model itself, so the hint is dropped before the name is used in a request.
+     */
+    static String stripContextWindow(String model) {
+        return model.replaceAll("\\[[^\\[\\]]*]$", "").strip();
+    }
+
     /** The others: the catalogue's variables in the server's environment. */
     private List<Found> vendor(String providerKey) {
         var access = com.superagent.core.provider.ProviderCatalog.find(providerKey).map(e -> e.access()).orElse(null);

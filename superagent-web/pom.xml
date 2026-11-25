@@ -28,11 +28,19 @@
     </dependency>
     <dependency>
       <groupId>com.superagent</groupId>
+      <artifactId>superagent-handover</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.superagent</groupId>
       <artifactId>superagent-files</artifactId>
     </dependency>
     <dependency>
       <groupId>com.superagent</groupId>
       <artifactId>superagent-project</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.superagent</groupId>
+      <artifactId>superagent-glossary</artifactId>
     </dependency>
     <dependency>
       <groupId>com.superagent</groupId>

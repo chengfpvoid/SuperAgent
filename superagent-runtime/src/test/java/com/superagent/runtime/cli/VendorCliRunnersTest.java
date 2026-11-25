@@ -13,6 +13,21 @@ import static org.assertj.core.api.Assertions.assertThat;
 /** The DeepSeek / Kimi / Qwen runners against output captured from the real CLIs (dsh 0.x, kimi 2.5.2). */
 class VendorCliRunnersTest {
 
+    @Test
+    void kimiHomesAreScopedToSessionAndCredentialFilesAreCleaned(@org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
+        KimiCliAgentRunner runner = new KimiCliAgentRunner("/usr/bin/true", 5);
+        AgentRunRequest first = new AgentRunRequest("one", null, dir.toString(), "hi", "kimi-k2", List.of(), false,
+                MCP, null, List.of(), null, new RunCredential("c1", null, "test-key", false));
+        AgentRunRequest second = new AgentRunRequest("two", null, dir.toString(), "hi", "kimi-k2", List.of(), false,
+                MCP, null, List.of(), null, new RunCredential("c2", null, "other-key", false));
+        assertThat(runner.environment(first)).isNotEqualTo(runner.environment(second));
+        runner.run(first, event -> {}, new com.superagent.core.chat.Cancellation());
+        java.nio.file.Path home = java.nio.file.Path.of(runner.environment(first).get("KIMI_CODE_HOME"));
+        assertThat(home).isDirectory();
+        assertThat(home.resolve("config.toml")).doesNotExist();
+        assertThat(home.resolve("mcp.json")).doesNotExist();
+    }
+
     private static final String MCP = "{\"mcpServers\":{\"superagent\":{\"type\":\"http\",\"url\":\"http://127.0.0.1:18080/mcp\","
             + "\"headers\":{\"Authorization\":\"Bearer turn-token\"}}}}";
 
@@ -78,8 +93,11 @@ class VendorCliRunnersTest {
         List<java.nio.file.Path> cleanup = new java.util.ArrayList<>();
         List<String> cmd = new CodeBuddyCliAgentRunner("codebuddy", 60).buildCommand(req, null, cleanup);
         assertThat(cmd).contains("-p", "--output-format", "stream-json", "--include-partial-messages",
-                "--model", "auto", "-y", "--strict-mcp-config", "--mcp-config");
-        assertThat(cmd).doesNotContain("--resume");
+                "--model", "auto", "--strict-mcp-config", "--mcp-config");
+        assertThat(cmd).containsSequence("--tools", "")
+                .containsSequence("--permission-mode", "dontAsk")
+                .containsSequence("--setting-sources", "");
+        assertThat(cmd).doesNotContain("-y", "--dangerously-skip-permissions", "--resume");
         String mcpFile = cmd.get(cmd.indexOf("--mcp-config") + 1);
         assertThat(java.nio.file.Files.readString(java.nio.file.Path.of(mcpFile)))
                 .contains("\"type\":\"http\"").contains("Bearer turn-token");
@@ -104,7 +122,9 @@ class VendorCliRunnersTest {
                 new RunCredential("c1", null, "sk-test", false));
         List<String> cmd = new CodeBuddyCliAgentRunner("codebuddy", 60).buildCommand(req, "cli-sess", List.of());
         assertThat(cmd).containsSequence("--resume", "cli-sess");
-        assertThat(cmd).containsSequence("--allowedTools", "Read Edit");
+        assertThat(cmd).containsSequence("--allowedTools", "Read Edit")
+                .containsSequence("--tools", "Read,Edit")
+                .containsSequence("--setting-sources", "");
         assertThat(cmd).doesNotContain("-y", "--append-system-prompt", "--mcp-config");
     }
 
@@ -114,11 +134,11 @@ class VendorCliRunnersTest {
         List<JsonLineCliRunner.Line> lines = new ArrayList<>();
         for (String l : List.of(
                 "{\"type\":\"init\",\"session_id\":\"g-sess-1\",\"model\":\"gemini-2.5-pro\"}",
-                "{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"Hel\"}",
-                "{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"Hello\"}",
+                "{\"type\":\"message\",\"role\":\"assistant\",\"delta\":true,\"content\":\"Hel\"}",
+                "{\"type\":\"message\",\"role\":\"assistant\",\"delta\":true,\"content\":\"lo\"}",
                 "{\"type\":\"tool_use\",\"tool_name\":\"read_file\",\"tool_id\":\"t1\"}",
                 "{\"type\":\"tool_result\",\"tool_id\":\"t1\",\"output\":\"ok\"}",
-                "{\"type\":\"result\",\"status\":\"success\",\"stats\":{\"inputTokens\":10,\"outputTokens\":2}}")) {
+                "{\"type\":\"result\",\"status\":\"success\",\"stats\":{\"input_tokens\":10,\"output_tokens\":2,\"cached\":0}}")) {
             lines.addAll(parser.parse(l));
         }
         assertThat(lines).extracting(JsonLineCliRunner.Line::type).containsExactly(
@@ -127,6 +147,7 @@ class VendorCliRunnersTest {
         assertThat(lines.get(0).payload()).isEqualTo("g-sess-1");
         assertThat(lines.get(1).payload()).isEqualTo("Hel");
         assertThat(lines.get(2).payload()).isEqualTo("lo");
+        assertThat(lines.get(5).payload()).isEqualTo("Hello");
         assertThat(parser.tokens("gemini-2.5-pro")).singleElement()
                 .satisfies(u -> {
                     assertThat(u.input()).isEqualTo(10);
@@ -142,14 +163,15 @@ class VendorCliRunnersTest {
                 new RunCredential("c1", null, "sk", false)))).isEqualTo("auto_edit");
         assertThat(GeminiCliAgentRunner.environment(req.credential(), java.nio.file.Path.of("/tmp/g")))
                 .containsEntry("GEMINI_API_KEY", "sk-test")
-                .containsEntry("GEMINI_CONFIG_DIR", "/tmp/g")
-                .containsEntry("HOME", "/tmp/g");
+                .containsEntry("GEMINI_CLI_HOME", "/tmp/g")
+                .containsEntry("HOME", "/tmp/g")
+                .doesNotContainKey("GEMINI_CONFIG_DIR");
 
         List<String> cmd = new GeminiCliAgentRunner("gemini", 60).buildCommand(req, null, List.of());
         assertThat(cmd).contains("-p", "--output-format", "stream-json", "--skip-trust",
                 "--approval-mode", "plan", "--model", "gemini-2.5-pro");
         assertThat(java.nio.file.Files.readString(
-                java.nio.file.Path.of("/tmp/.superagent/gemini-home/s1/settings.json")))
+                java.nio.file.Path.of("/tmp/.superagent/gemini-home/s1/.gemini/settings.json")))
                 .contains("httpUrl");
     }
 
@@ -181,7 +203,7 @@ class VendorCliRunnersTest {
         assertThat(MinimaxCliAgentRunner.configYaml("sk-test", "minimax/MiniMax-M2.1"))
                 .contains("apiKey: \"sk-test\"").contains("defaultModel: \"minimax/MiniMax-M2.1\"");
 
-        List<String> cmd = new MinimaxCliAgentRunner("mcode", 60).buildCommand(req, null, List.of());
+        List<String> cmd = new MinimaxCliAgentRunner("mcode", 60).buildCommand(req, null, new ArrayList<>());
         assertThat(cmd).containsSequence("exec", "--output-format", "stream-json")
                 .containsSequence("--permission", "off")
                 .containsSequence("--model", "minimax/MiniMax-M2.1")
@@ -189,6 +211,36 @@ class VendorCliRunnersTest {
         assertThat(java.nio.file.Files.readString(
                 java.nio.file.Path.of("/tmp/.superagent/mcode-home/s1/mcp.json")))
                 .contains("http://127.0.0.1:18080/mcp");
+    }
+
+    @Test
+    void qoderUsesClaudeShapedFlagsAndKeepsTheTokenInTheEnvironment() throws Exception {
+        AgentRunRequest req = request("qwen3-coder");
+        List<java.nio.file.Path> cleanup = new java.util.ArrayList<>();
+        List<String> cmd = new QoderCliAgentRunner("qodercn", 60).buildCommand(req, null, cleanup);
+        assertThat(cmd).contains("-p", "--output-format", "stream-json", "--include-partial-messages",
+                "--model", "qwen3-coder", "--strict-mcp-config", "--mcp-config");
+        assertThat(cmd).contains("hi");   // the prompt travels in argv
+        String mcpFile = cmd.get(cmd.indexOf("--mcp-config") + 1);
+        assertThat(java.nio.file.Files.readString(java.nio.file.Path.of(mcpFile)))
+                .contains("\"type\":\"http\"").contains("Bearer turn-token");
+        for (java.nio.file.Path f : cleanup) {
+            java.nio.file.Files.deleteIfExists(f);
+        }
+
+        // The CN site and the personal access token travel in the environment, never in argv.
+        java.util.Map<String, String> env = new QoderCliAgentRunner("qodercn", 60).environment(req);
+        assertThat(env).containsEntry(QoderCliAgentRunner.PAT_ENV, "sk-test")
+                .containsEntry("NO_BROWSER", "1");
+        assertThat(String.join(" ", cmd)).doesNotContain("sk-test");
+
+        // A resumed turn keeps the CLI's own session; a tool allowlist is the CLI's --allowed-tools (comma-separated).
+        AgentRunRequest next = new AgentRunRequest("s1", "cli-sess", "/tmp", "hi", "m",
+                List.of("Read", "Edit"), false, null, "be brief", List.of(), null,
+                new RunCredential("c1", null, "sk-test", false));
+        List<String> resumed = new QoderCliAgentRunner("qodercn", 60).buildCommand(next, "cli-sess", List.of());
+        assertThat(resumed).containsSequence("--resume", "cli-sess").containsSequence("--allowed-tools", "Read,Edit");
+        assertThat(resumed).doesNotContain("--yolo", "--mcp-config");
     }
 
     private static AgentRunRequest request(String model) {

@@ -11,6 +11,8 @@ import java.util.List;
 /**
  * Parses Gemini CLI {@code --output-format stream-json} events into {@link JsonLineCliRunner.Line}s.
  * Event types: {@code init}, {@code message}, {@code tool_use}, {@code tool_result}, {@code error}, {@code result}.
+ * Assistant {@code message} events with {@code delta:true} carry incremental content; without {@code delta}
+ * the content is treated as a full snapshot (legacy / non-stream paths).
  */
 final class GeminiStreamParser implements JsonLineCliRunner.LineParser {
 
@@ -42,11 +44,16 @@ final class GeminiStreamParser implements JsonLineCliRunner.LineParser {
                 if (content.isEmpty()) {
                     yield List.of();
                 }
-                // Streamed chunks: emit only the delta when content grows.
-                String delta = content.startsWith(lastAssistant) ? content.substring(lastAssistant.length()) : content;
+                if (root.path("delta").asBoolean(false)) {
+                    // Official stream-json: each chunk is a delta to append (not a cumulative prefix).
+                    lastAssistant += content;
+                    yield List.of(new JsonLineCliRunner.Line(AgentEventType.TEXT, content));
+                }
+                // Non-delta snapshot: emit only the new suffix when content grows; otherwise replace.
+                String emit = content.startsWith(lastAssistant) ? content.substring(lastAssistant.length()) : content;
                 lastAssistant = content;
-                yield delta.isEmpty() ? List.of()
-                        : List.of(new JsonLineCliRunner.Line(AgentEventType.TEXT, delta));
+                yield emit.isEmpty() ? List.of()
+                        : List.of(new JsonLineCliRunner.Line(AgentEventType.TEXT, emit));
             }
             case "tool_use" -> {
                 String name = root.path("tool_name").asText(root.path("name").asText("tool"));
@@ -83,26 +90,27 @@ final class GeminiStreamParser implements JsonLineCliRunner.LineParser {
         if (stats == null) {
             return List.of();
         }
-        // Gemini reports models.<id>.{prompt,candidates,…} or flat input/output under stats.
+        // stream-json stats: input_tokens / output_tokens / cached (+ optional models.<id>.*).
+        // Prefer per-model detail when present; do not also accumulate the flat totals.
         List<TokenUsage> out = new ArrayList<>();
         JsonNode models = stats.path("models");
         if (models.isObject() && !models.isEmpty()) {
-            models.fields().forEachRemaining(e -> {
-                JsonNode m = e.getValue();
-                long in = Tokens.n(m, "promptTokenCount") + Tokens.n(m, "prompt");
-                long cached = Tokens.n(m, "cachedContentTokenCount");
-                long write = Tokens.n(m, "cacheCreationTokenCount");
-                long output = Tokens.n(m, "candidatesTokenCount") + Tokens.n(m, "candidates")
-                        + Tokens.n(m, "outputTokenCount");
-                out.add(new TokenUsage(e.getKey(), Math.max(0, in - cached - write), cached, write, 0, output, 0, null));
-            });
-            return out;
+            models.fields().forEachRemaining(e -> out.add(streamUsage(e.getKey(), e.getValue())));
+            return out.stream().filter(u -> !u.nothingUsed()).toList();
         }
-        long in = Tokens.n(stats, "inputTokens") + Tokens.n(stats, "promptTokenCount");
-        long output = Tokens.n(stats, "outputTokens") + Tokens.n(stats, "candidatesTokenCount");
-        if (in == 0 && output == 0) {
-            return List.of();
+        TokenUsage flat = streamUsage(model, stats);
+        return flat.nothingUsed() ? List.of() : List.of(flat);
+    }
+
+    /** Splits cached from total input_tokens; uses explicit {@code input} when the CLI already split it. */
+    private static TokenUsage streamUsage(String model, JsonNode node) {
+        long output = Tokens.n(node, "output_tokens");
+        long cached = Tokens.n(node, "cached");
+        long explicitInput = Tokens.n(node, "input");
+        if (explicitInput > 0) {
+            // StreamJsonFormatter also emits non-cached "input" alongside total input_tokens.
+            return new TokenUsage(model, explicitInput, cached, 0, 0, output, 0, null);
         }
-        return List.of(new TokenUsage(model, in, 0, 0, 0, output, 0, null));
+        return Tokens.fromTotalInput(model, Tokens.n(node, "input_tokens"), cached, 0, output, 0);
     }
 }

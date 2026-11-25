@@ -19,6 +19,7 @@ import org.springframework.stereotype.Service;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import com.superagent.core.writing.StyleLexicon;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -54,7 +55,7 @@ public class SkillService {
     private static final Logger log = LoggerFactory.getLogger(SkillService.class);
     private static final Pattern ID = Pattern.compile("[0-9a-fA-F-]{36}");
     private static final int MAX_CONTENT_CHARS = 200_000;
-    private static final String SEEDED = "skill.seeded";
+    private static final String SEEDED = "skill.seeded", GENRES_SEEDED = "skill.genres.seeded", LEXICON_SEEDED = "skill.lexicon.seeded";
 
     private final SkillStore store;
     private final SystemSettingStore settings;
@@ -464,5 +465,63 @@ public class SkillService {
             }
         }
         settings.put(SEEDED, "true");
+    }
+
+    /** The writing genre packs and shared standards, once per company, also for one that already had the examples. */
+    @EventListener(CompanyStarted.class)
+    void seedGenresOnce() {
+        if (settings.all().containsKey(GENRES_SEEDED)) {
+            return;
+        }
+        Set<String> have = live().filter(s -> ownerOf(s) == null).map(Skill::name).collect(Collectors.toSet());
+        GenreSeeds.ALL.stream().filter(seed -> !have.contains(seed.name())).forEach(seed -> insert(seed, COMPANY, "system"));
+        settings.put(GENRES_SEEDED, "true");
+    }
+
+    /**
+     * Companies that had the plain-writing standard before it carried a word list: append the list once, only to a skill
+     * that has none, so what the company changed is never replaced.
+     */
+    @EventListener(CompanyStarted.class)
+    void seedLexiconOnce() {
+        if (settings.all().containsKey(LEXICON_SEEDED)) {
+            return;
+        }
+        live().filter(s -> ownerOf(s) == null && s.name().strip().equals(StyleLexicon.SKILL_NAME)
+                && !StyleLexicon.hasBlock(s.content())).forEach(s -> store.save(new Skill(s.id(), s.name(), s.description(),
+                s.category(), s.content() + GenreSeeds.LEXICON, s.space(), s.enabled(), false, s.createdBy(), s.updatedBy(),
+                s.createdAt(), Instant.now())));
+        settings.put(LEXICON_SEEDED, "true");
+    }
+
+    /** The company's enabled skills (not anyone's personal ones): where the writing flow finds its genre packs. */
+    public List<Skill> companySkills() {
+        return live().filter(s -> s.enabled() && ownerOf(s) == null).toList();
+    }
+
+    /** Employee handover: rewrite {@code personal:from} skills to {@code personal:to}. Company skills untouched. */
+    public int transferPersonalSkills(String fromUserId, String toUserId) {
+        if (fromUserId == null || toUserId == null || fromUserId.equals(toUserId)) {
+            return 0;
+        }
+        String fromSpace = "personal:" + fromUserId;
+        String toSpace = "personal:" + toUserId;
+        int n = 0;
+        for (Skill s : store.list()) {
+            if (!s.deleted() && fromSpace.equals(s.space())) {
+                store.save(s.withSpace(toSpace, toUserId));
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /** Live personal skills owned by this user id. */
+    public int countPersonal(String userId) {
+        if (userId == null) {
+            return 0;
+        }
+        String space = "personal:" + userId;
+        return (int) live().filter(s -> space.equals(s.space())).count();
     }
 }
