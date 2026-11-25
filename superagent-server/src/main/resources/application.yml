@@ -50,7 +50,7 @@ superagent:
     mysql:
       url: ${SUPERAGENT_STORAGE_MYSQL_URL:jdbc:mysql://127.0.0.1:3306/superagent?createDatabaseIfNotExist=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true}
       username: ${SUPERAGENT_STORAGE_MYSQL_USERNAME:root}
-      password: ${SUPERAGENT_STORAGE_MYSQL_PASSWORD:}
+      password: ${SUPERAGENT_STORAGE_MYSQL_PASSWORD:Hollis666}
   agent:
     workspace-dir: ./data/workspaces
   attachments:
